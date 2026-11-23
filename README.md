@@ -1,26 +1,45 @@
 # dsh-rsi
 
-DeepSeek Harness 的 RSI（Recursive Self-Improvement）工具包：把 Harness² 的 Propose–Probe–Compose 循环固化为 9 个全局工具，并补齐「失败证据自动收集 → 反思任务卡 → 巡检摘要 → 提案审核 → 采纳 → 教训沉淀」闭环。所有写入都限制在工作区的 `.rsi` 目录（以及 adopt 允许的 harness 文件）内。
+DeepSeek Harness 的 RSI（Recursive Self-Improvement）工具包：把 Harness² 的 Propose–Probe–Compose 循环固化为 12 个全局工具，并补齐「失败证据自动收集 → 反思任务卡 → 巡检摘要 → 提案审核 → 采纳（冒烟 + 回滚）→ 教训沉淀」闭环。所有写入都限制在工作区的 `.rsi` 目录（以及 adopt 允许的 harness 文件）内。
 
 ## 工具
 
 | 工具 | 作用 |
 | --- | --- |
-| `rsi-plan` | 创建一轮实验：给定统一任务 T + 候选 harness 变体，落盘任务/评分表/变体文件，返回每个 probe 的启动指令（由模型用 subagent 工具执行） |
-| `rsi-run` | 实验状态机（只读）：扫描 `.rsi/runs` 下每个变体的 probe 产出，报告 `done/partial/empty`、评分汇总状态，并对缺失 probe 重放启动指令 |
-| `rsi-collect` | 按 rubric 对每个 probe 产出机器评分，生成 report.md/report.json（含 total/maxTotal/passed/hasPassScore/rubricHashVerified/failedVariants）。评分表只能读 `rubric.json` 并与创建时的 sha256 比对，不接受调用方覆盖 |
-| `rsi-adopt` | 采纳 harness 改动：**必须传 `proposalId` 且提案状态为 `approved`**（否则拒绝）。workspace 模式（AGENTS.md / .agents/**/SKILL.md / .rsi/** 排除 bundles|evidence|state|proposals|backups，先备份、后写入、决策追加进 harness-lessons.md）或 preset-bundle 模式（落盘 cordis.patch.yml 到 .rsi/presets/，返回 plugin_manager 安装指令，人工批准执行）。成功后提案 `approved → applied`；状态更新失败会回滚已写文件并报错 |
-| `rsi-status` | 查看实验、教训条目/行数、备份、preset bundles、提案库分布、反思卡与巡检摘要数量、最近反思/摘要时间、状态文件错误（`stateError`） |
+| `rsi-plan` | 创建一轮实验：统一任务 T + 候选 harness 变体（可给 `edits` 按 8 组件合成），可配 `repeats`（默认 3）、`mode`（parallel/sequential）、`budget`、`minPassRate`、`parent`；落盘任务/评分表/变体文件并返回每个 probe 的启动指令（模型用 subagent 工具执行） |
+| `rsi-run` | 实验状态机（只读）：按变体 × 重复扫描 probe 产出（`done/partial/empty`），报告 `repeats/mode/budget/parent/children/archived/meta`，对缺失的 `(variant, repeat)` 重放启动指令 |
+| `rsi-collect` | 按 rubric 逐次评分并按重复聚合（均值/标准差/passRate），生成 report.md/report.json（含 `repeats/minPassRate/failedVariants/rubricHashVerified`）。评分表只读 `rubric.json` 并与创建时的 sha256 比对 |
+| `rsi-compare` | 对比式探测：对同一实验两个变体的第 k 次产出做目录级 diff（only-a/only-b/changed/same），写 `compare/<a>__vs__<b>/r<k>/compare.{md,json}`；可回写 `judge{winner,reason,confidence}` |
+| `rsi-archive` | 实验归档：`archive`（移到 `.rsi/runs/_archive/<ts>-<runId>` 并标记）、`restore`、`list`（同时给出 parent→children 血缘） |
+| `rsi-audit` | probe 写隔离审计：扫描实验 `createdAt` 之后工作区内（`.rsi` 之外）被写入的文件，暴露越界写 |
+| `rsi-adopt` | 采纳 harness 改动：**必须传 `proposalId` 且提案为 `approved`**。workspace 模式（AGENTS.md / .agents/**/SKILL.md / `.rsi/**` 排除 bundles|evidence|state|proposals|backups）先备份、后写入，再跑冒烟（可选 `smoke{command,timeoutMs}` + js/json/非空检查），失败自动回滚；preset-bundle 模式落盘 cordis.patch.yml 到 `.rsi/presets/` 并返回 plugin_manager 安装指令 |
+| `rsi-status` | 查看实验、教训条目/行数、备份、preset bundles、提案库分布、反思卡/巡检摘要数量、最近反思与摘要时间、状态文件错误（`stateError`） |
 | `rsi-evidence` | 读取自动收集的失败证据（列文件 / 按文件读最近记录） |
-| `rsi-propose` | 基于证据起草提案写入 `.rsi/proposals/<ts>-<slug>.md` 并登记到 `index.json`（状态 `draft`）；`basedOnEvidence` 为空直接拒绝 |
-| `rsi-review` | 审核提案：`list` 列提案与状态、`approve`/`reject` 改状态（同步改写提案 md 的状态行） |
-| `rsi-lesson` | 教训库：`add` 手动追加一条教训（同一正文去重）、`list` 读取最近条目；`rsi-adopt` 采纳时也会自动追加 |
+| `rsi-propose` | 基于证据起草提案写入 `.rsi/proposals/<ts>-<slug>.md` 并登记 `index.json`（`draft`）；`basedOnEvidence` 为空直接拒绝 |
+| `rsi-review` | 审核提案：`list` / `approve` / `reject`，改状态并同步改写提案 md 的状态行 |
+| `rsi-lesson` | 教训库：`add` 追加（正文去重）、`list` 读取最近条目；`rsi-adopt` 采纳时也会自动追加 |
+
+## 实验生命周期（B 批）
+
+```
+rsi-plan  →  variants/<n>-<label>/{harness.md,edits.json}
+             probes/<n>-<label>/r<k>/         （repeats>1 时；旧实验无 r<k> 按单次兼容）
+rsi-run   →  逐 (variant, repeat) 看 done/partial/empty，给出补跑指令
+rsi-collect → 逐次评分 → 变体聚合（executed/passRate/mean/stdev）→ report.md/json
+rsi-compare → 两变体同一 k 的产出 diff + 可选裁判结论
+rsi-archive → .rsi/runs/_archive/<ts>-<runId>，索引保留 parent/children 血缘
+```
+
+- 聚合判定：**执行齐全部重复** 且 `passRate ≥ minPassRate`（默认 1）且 **均值 ≥ passScore**；缺跑的重复按 0 分计入 passRate，任一次有机器项失败即该次未通过。
+- `budget` 默认 24，`variants × repeats > budget` 时 `rsi-plan` 直接拒绝；`config.json` 记录 `repeats/minPassRate/mode/budget/parent/rubricRuleVersion/meta`（node/platform/arch/gitHead/cwd/createdAt）。
+- `variants[].edits` 只能改 8 个组件之一：`system-prompt`、`guardrails`、`memory`、`skills`、`tool-guidance`、`scripts`、`subagents`、`plugins`；不给 `edits` 时回落到整份 `harness` 文本。
+- 运行索引 `.rsi/runs/index.json`（原子写，坏 JSON 转 `.corrupt-<stamp>.bak` 并保留原文件）。
 
 ## 自动闭环（Tier 3 + Tier 4）
 
 ```
 tools/result(isError) ┐
-agent/error          ├→ .rsi/evidence/<session>.jsonl
+agent/error          ├→ .rsi/evidence/<session>.jsonl（先脱敏再落盘）
 feedback/committed   ┘        │
                               │ 每轮 turn/end（session/event）
                               ▼
@@ -37,15 +56,51 @@ feedback/committed   ┘        │
                               → rsi-adopt(proposalId) → applied → rsi-lesson 沉淀
 ```
 
-- 水位与冷却记在 `.rsi/state/reflection.json`：反思按会话隔离（`sessions.<sessionId>.{lastReflectAt,lastEvidenceCount,lastCard}`），摘要用已消化清单（`digestConsumed[]`）判定未消化卡片，不再依赖文件 mtime。状态文件损坏会转存 `.corrupt-<stamp>.json` 并在 `rsi-status` 的 `stateError` 中告警。
+- 水位与冷却记在 `.rsi/state/reflection.json`：反思按会话隔离，摘要用已消化清单（`digestConsumed[]`）判定未消化卡片。状态文件损坏会转存 `.corrupt-<stamp>.json` 并在 `rsi-status` 的 `stateError` 中告警。
+- 证据写入前经 `redactSecrets` 脱敏（OpenAI/AWS/GitHub/Slack 令牌、JWT、`Bearer` 头、`api_key|token|secret|password` 赋值），再按 500 字符截断；证据文件超 200 行或 200KB 时轮转 `.1.jsonl`。
 - 反思卡与巡检摘要只做提示与证据摘要，不自动改任何 harness 文件；采纳必须经过 `rsi-review approve` + `rsi-adopt`。
 - 本版未做：Host `HarnessEditor` service、插件页面板内的实时审核 UI（Electron 客户端无通用 host RPC 网关，面板为静态指引，数据以文件为准）。
 
+## rubric 机器评分项
+
+| kind | 语义 |
+| --- | --- |
+| `file-exists` | probe 目录内 path 文件存在且非空（0 字节 / 只有空白判失败） |
+| `line-count` | 文件行数在 min~max 区间 |
+| `regex-all-lines` | 所有行匹配 pattern 正则 |
+| `regex-last-line` | 最后一行匹配 pattern 正则 |
+| `contains` | 文件内容包含 pattern 子串 |
+| `command` | 在 probe 目录执行 `run` 命令，退出码等于 `expectExit`（默认 0），可选 `pattern` 匹配 stdout+stderr；超时上限 60s |
+| `manual` | 人工评审（ok=null，collect 汇总进「待人工评审」清单） |
+
+`passScore` 为加权及格分（必须是 > 0 的有限数字）；每次得分 = Σ(通过项 × weight)。判定规则：**任一次中任一机器评分项失败即判该次未通过**，变体还需执行齐重复次数、`passRate ≥ minPassRate`、均值 ≥ `passScore`；顶层 `passed` 要求所有变体都通过。`manual` 项不进分母。变体目录以 `variants/` 为准，缺对应 `probes/` 目录记 0 分。
+
+正则安全（C5）：`pattern` 长度 ≤ 1000、输入 ≤ 512KB，拒绝嵌套量词与反向引用，`vm` 内带 250ms 超时执行，防 ReDoS。
+
+## 典型一轮 P-P-C
+
+1. `rsi-plan`：task=T，variants=[基线, 候选 edits A]，repeats=3，rubric=机器可判项（含必要时 `command`）。
+2. 模型按 instructions 用 subagent 为每个 `(变体, 第 k 次)` 启动**全新**子代理，任务文本完全一致，只有 harness 约束不同；probe 只能写自己的 `probes/<n>-<label>/r<k>/`。
+3. `rsi-run`：查看谁还空着，按指令补跑；`rsi-audit` 检查有没有越界写。
+4. `rsi-collect`：得到逐次分数与聚合判定。
+5. `rsi-compare`：对关键差异做行为对比，必要时让裁判子代理给 `judge`。
+6. 有稳定差异 → `rsi-propose` → `rsi-review approve` → `rsi-adopt`（冒烟通过才落教训、标 applied）→ `rsi-lesson`；无差异 → 不采纳，把结论记进 harness-lessons.md。
+7. 收尾 `rsi-archive` 归档老实验。
+
+## 单测
+
+```bash
+node --test "test/*.test.mjs"   # 28 项：schema/fsx/redact/regex-safe/rubric/compose/compare + 集成
+```
+
+- `test/integration.test.mjs` 用 fake ctx 注册全部 12 工具，覆盖 plan→重复→collect、compare+judge、预算/非法 edits 拒绝、archive/restore、audit、adopt 冒烟回滚与门禁、证据脱敏。
+- 代码按职责拆在 `lib/`：`fsx`（文件与哈希、原子写）、`schema`（参数编译）、`text`、`redact`、`regex-safe`、`rubric`（评分与聚合）、`compose`（组件合成）、`compare`（目录 diff）、`runs`（run 目录与索引）、`audit`（写隔离扫描）。不引入任何 npm 依赖。
+
 ## 约束
 
-- 所有工具都要求显式传 `cwd`（工作区绝对路径）；文件写入通过路径前缀校验限制在 cwd 内。
+- 所有工具都要求显式传 `cwd`（工作区绝对路径）；文件写入通过路径前缀 + realpath 校验限制在 cwd 内。
 - `.rsi` 目录位置固定（不可通过插件 config 配置，本版本未导出 Config）。
-- `rsi-propose` / `rsi-adopt` 红线：证据为空时拒绝；workspace 模式只允许写 AGENTS.md、.agents/**/SKILL.md、`.rsi/` 下非 bundles|evidence|state|proposals|backups 的路径；路径含 `..`、绝对路径或经符号链接逃逸一律拒绝（realpath 校验）。
+- `rsi-propose` / `rsi-adopt` 红线：证据为空时拒绝；workspace 模式只允许写 AGENTS.md、`.agents/**/SKILL.md`、`.rsi/` 下非 bundles|evidence|state|proposals|backups 的路径；路径含 `..`、绝对路径或经符号链接逃逸一律拒绝。
 - 工具 `parameters` 在 `apply()` 内统一走 `compileParameters` 编译：作者侧 DSL（属性级 `required: true`）必须转成模型端合法 JSON Schema，否则非 PTC 模式下整批工具定义会被 provider 拒绝。
 
 ## 目录布局
@@ -54,15 +109,19 @@ feedback/committed   ┘        │
 .rsi/
   runs/<runId>/
     task.md             # 统一任务 T
-    rubric.json         # 评分表（passScore + items）
-    config.json         # 实验元信息
+    rubric.json         # 评分表（passScore/minPassRate + items）
+    config.json         # 实验元信息（repeats/mode/budget/parent/meta…）
     variants/<n>-<label>/harness.md   # 各候选 harness
-    probes/<n>-<label>/               # 各 probe 子代理的产出目录（result.txt / report.md 视为完成）
-    report.md / report.json           # rsi-collect 汇总
-  memory/harness-lessons.md   # 教训记忆（rsi-adopt / rsi-lesson 追加）
+    variants/<n>-<label>/edits.json   # 组件级改动（若给了 edits）
+    probes/<n>-<label>/r<k>/          # 第 k 次 probe 产出（result.txt / report.md 视为完成）
+    compare/<a>__vs__<b>/r<k>/        # rsi-compare 的 diff 与裁判结论
+    report.md / report.json           # rsi-collect 汇总（逐次表 + 聚合判定）
+  runs/index.json              # 运行索引与血缘（parent/children/archived）
+  runs/_archive/<ts>-<runId>/  # rsi-archive 归档目录
+  memory/harness-lessons.md    # 教训记忆（rsi-adopt / rsi-lesson 追加）
   backups/<ts>/                # workspace 模式改动前的备份
   presets/<name>/              # preset-bundle 模式产物（package.json + cordis.patch.yml + README.md）
-  evidence/<sessionId>.jsonl   # 自动失败证据（tool-error / agent-error / 差评反馈；超 200 行/200KB 时轮转 .1.jsonl）
+  evidence/<sessionId>.jsonl   # 自动失败证据（已脱敏；超限轮转 .1.jsonl）
   proposals/<ts>-<slug>.md     # rsi-propose 提案正文
   proposals/index.json         # 提案库与生命周期（draft/approved/rejected/applied）
   inbox/reflect-<ts>.md        # 自动反思任务卡
@@ -70,57 +129,17 @@ feedback/committed   ┘        │
   state/reflection.json        # 反思（按会话）/摘要水位与已消化清单
 ```
 
-## rubric 机器评分项
-
-| kind | 语义 |
-| --- | --- |
-| `file-exists` | probe 目录内 path 文件存在 |
-| `line-count` | 文件行数在 min~max 区间 |
-| `regex-all-lines` | 所有行匹配 pattern 正则 |
-| `regex-last-line` | 最后一行匹配 pattern 正则 |
-| `contains` | 文件内容包含 pattern 子串 |
-| `manual` | 人工评审（ok=null，collect 汇总进「待人工评审」清单） |
-
-`passScore` 为加权及格分（必须是 > 0 的有限数字）；每个变体得分 = Σ(通过项 × weight)。
-
-判定规则：**任一机器评分项失败即判该变体未通过**，`passScore` 只作分数门槛；顶层 `passed` 要求所有变体都通过。文件缺失、0 字节、只有空白字符都判该项失败。`manual` 项不进分母（只进「待人工评审」清单）。变体目录以 `variants/` 为准，缺对应 `probes/` 目录记 0 分并标 `probe 目录缺失`。
-
-## 典型一轮 P-P-C
-
-1. `rsi-plan`：task=T，variants=[基线, 候选规则 A]，rubric=机器可判项。
-2. 模型按返回的 instructions，用 subagent 工具为每个变体启动**全新**子代理（不用 fork），任务文本完全一致，只有 harness 约束不同；probe 只能写自己的 probes/<n>-<label>/ 目录。
-3. `rsi-run`：随时查看哪个 probe 还空着/只写了一半，按返回指令补跑。
-4. `rsi-collect`：得到各变体得分对比。
-5. 有证据差异 → `rsi-propose` 记录提案 → `rsi-review approve` → `rsi-adopt`（workspace 改 harness 文件 / preset-bundle 落盘 bundle）→ `rsi-lesson` 记下决策；无差异 → 不采纳，把结论记进 harness-lessons.md。
-
 ## 安装
 
-### 方式一：link 到 profile（开发调试）
+两种方式任选：
 
-在 profile 目录（例如 `C:\Users\<you>\.dsh\profiles\desktop`）的 `package.json` 中：
+1. **profile link（本地开发）**：把本仓库路径加进 `~/.dsh/profiles/<name>/package.json` 的 `dependencies`（`"dsh-rsi": "link:D:/path/to/DSH-RSI"`），并在 `dsh.profile.bundles` 末尾追加 `"dsh-rsi"`，然后重启 DSH。
+2. **插件管理器**：DSH 侧边栏「插件」→ 右上「+ 添加插件」→ 输入本仓库路径或 npm 包名安装，然后在「已安装插件」里确认 `dsh-rsi` 为「运行中」。
 
-```json
-{
-  "dependencies": { "dsh-rsi": "link:D:/Hermes/Workspace/10_Projects/DSH-RSI" },
-  "dsh": { "profile": { "bundles": ["dsh-rsi"] } }
-}
-```
-
-然后重启 DeepSeek Harness（插件代码不热更新）。
-
-### 方式二：插件管理器
-
-GUI 侧边栏「插件」→「+ 添加插件」，填入本地目录路径或包名；等价于 Host 工具 `plugin_manager` 的 `install_bundle`（`target` 传包名字符串）。
-
-安装后可在「插件 → 已安装插件 → RSI 工具包」查看状态，工具会出现在新会话中。
-
+安装后 12 个 `rsi-*` 工具出现在模型工具集中（PTC 模式下以程序内 SDK 声明出现）；客户端面板「RSI 改进」在会话侧栏。
 ## 版本
 
-- 1.2.0：新增 `rsi-run`（实验状态机）、`rsi-lesson`（教训库）、turn/end 自动巡检摘要（未消化反思卡 ≥ 3 张时生成 digest 卡）、`rsi-status` 增补 `digests`/`lessonEntries`/`lastDigestAt`、`rsi-collect` 报告补充 total/maxTotal/passed。
-- 1.1.0：新增提案库与生命周期、`rsi-review`、turn/end 自动反思卡、`rsi-adopt --proposalId` 标记 applied、`rsi-status` 汇总提案/反思；修复 parameters 未经编译导致的非法 JSON Schema。
-
-## 版本
-
-- 1.3.0（A 批修复）：采纳门禁（`rsi-adopt` 必须带 approved 提案、`applied` 只能来自 `approved`、失败回滚）；采纳白名单 fail-closed（拒绝 `..`/绝对路径/符号链接逃逸，排除自身 bundles 等目录）；证据修复（读宿主 `exec.arguments`、只采差评反馈、按会话落库）；评分表完整性（plan 记录 sha256，collect 比对，删除 `rubric` 覆盖参数，`passScore` 校验）；评分语义（空文件/空白文件失败、`file-exists` 校验非空、manual 不进分母、缺 probe 记 0、任一失败即变体未通过）；状态隔离（反思按会话、摘要用已消化清单、坏状态转存告警、证据轮转、原子写 + `.bak`）。
-- 1.2.0：新增 `rsi-run`（实验状态机）、`rsi-lesson`（教训库）、turn/end 自动巡检摘要（未消化反思卡 ≥ 3 张时生成 digest 卡）、`rsi-status` 增补 `digests`/`lessonEntries`/`lastDigestAt`、`rsi-collect` 报告补充 total/maxTotal/passed。
-- 1.1.0：新增提案库与生命周期、`rsi-review`、turn/end 自动反思卡、`rsi-adopt --proposalId` 标记 applied、`rsi-status` 汇总提案/反思；修复 parameters 未经编译导致的非法 JSON Schema。
+- 1.4.0（B + C 批）：重复采样与统计判定（`repeats`/`minPassRate`/均值与标准差、缺跑记 0）；对比式探测 `rsi-compare`（目录 diff + judge）；组件级编辑合成（8 组件 `edits`）；`command` 评分项；预算校验与 `mode`（parallel/sequential）+ `meta` 复现元数据；`rsi-archive` 归档与 parent/children 血缘索引；采纳冒烟校验与自动回滚（C1）；写隔离审计 `rsi-audit`（C2）；证据脱敏（C3）；`stamp()` 毫秒（C4）；ReDoS 防护（C5）；`lib/` 拆分 + `node --test` 28 项单测（C6）。
+- 1.3.0（A 批修复）：采纳门禁（`rsi-adopt` 必须带 approved 提案、`applied` 只能来自 `approved`、失败回滚）；采纳白名单 fail-closed；证据修复（读宿主 `exec.arguments`、只采差评反馈、按会话落库）；评分表完整性（sha256 比对、删除 `rubric` 覆盖参数）；评分语义（空文件失败、manual 不进分母、任一失败即未通过）；状态隔离（按会话水位、已消化清单、坏状态转存、证据轮转、原子写 + `.bak`）。
+- 1.2.0：新增 `rsi-run`（实验状态机）、`rsi-lesson`（教训库）、turn/end 自动巡检摘要、`rsi-status` 增补 `digests`/`lessonEntries`/`lastDigestAt`。
+- 1.1.0：新增提案库与生命周期、`rsi-review`、turn/end 自动反思卡、`rsi-adopt --proposalId`；修复 parameters 未经编译导致的非法 JSON Schema。

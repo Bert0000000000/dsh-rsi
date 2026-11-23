@@ -7,26 +7,34 @@ window.__ModuleLoader__.load({
     const React = require('react')
 
     function RsiSection() {
+      const line = (text, props) => React.createElement('div', props ?? null, text)
+      const item = (text) => React.createElement('li', { key: text }, text)
       return React.createElement(
         'div',
         { style: { padding: '10px 12px', fontSize: '12px', lineHeight: '1.7' } },
-        React.createElement('div', { style: { fontWeight: 600, marginBottom: '6px' } }, 'RSI 改进 · Recursive Self-Improvement'),
-        React.createElement('div', null, '失败证据自动收集到 <cwd>/.rsi/evidence/（工具报错、agent 错误、负向反馈）。'),
-        React.createElement('div', null, '每轮结束（turn/end）若新增失败证据 ≥ 3 条，会在 .rsi/inbox/ 生成反思任务卡。'),
-        React.createElement('div', null, '未消化反思卡 ≥ 3 张时，再生成一份巡检摘要 digest-<ts>.md（来源/工具排名/待审提案）。'),
-        React.createElement('div', null, '审核流程（在对话中对 agent 说或直接调用工具）：'),
+        line('RSI 改进 · Recursive Self-Improvement', { style: { fontWeight: 600, marginBottom: '6px' } }),
+        line('失败证据自动收集到 <cwd>/.rsi/evidence/（工具报错、agent 错误、负向反馈），落盘前脱敏密钥。'),
+        line('每轮结束（turn/end）若新增失败证据 ≥ 3 条，会在 .rsi/inbox/ 生成反思任务卡；未消化卡 ≥ 3 张再生成巡检摘要 digest-<ts>.md。'),
+        line('实验支持重复采样（repeats）与预算（budget）：probes/<变体>/r<k>/ 逐次产出，collect 按均值 + passRate 判定。'),
+        line('审核流程（在对话中对 agent 说或直接调用工具）：'),
         React.createElement(
           'ul',
           { style: { margin: '4px 0', paddingLeft: '18px' } },
-          React.createElement('li', null, 'rsi-evidence — 查看自动收集的失败证据'),
-          React.createElement('li', null, 'rsi-run — 查看实验/变体/probe 产出与补跑指令'),
-          React.createElement('li', null, 'rsi-propose — 基于证据起草 harness 改进提案'),
-          React.createElement('li', null, 'rsi-review — 列出提案并 approve/reject（提案库 .rsi/proposals/index.json）'),
-          React.createElement('li', null, 'rsi-adopt — 仅采纳已 approve 的提案（自动备份 + 记录教训 + 标记 applied，失败回滚）'),
-          React.createElement('li', null, 'rsi-lesson — 追加/查看教训库 harness-lessons.md'),
+          [
+            'rsi-plan — 建实验（variants/repeats/mode/budget/rubric，可选 edits 按 8 组件合成）',
+            'rsi-run — 查看实验/变体/第 k 次产出与补跑指令',
+            'rsi-collect — 逐次评分 + 聚合判定（rubric 哈希校验，任一机器项失败即未通过）',
+            'rsi-compare — 同实验两变体的产出 diff，可回写裁判结论',
+            'rsi-audit — 检查 probe 是否越界写了 .rsi 之外的文件',
+            'rsi-archive — 归档/恢复实验，保留 parent→children 血缘',
+            'rsi-propose — 基于证据起草提案',
+            'rsi-review — 列提案并 approve/reject（.rsi/proposals/index.json）',
+            'rsi-adopt — 仅采纳已 approve 的提案：备份 → 写入 → 冒烟（可选 smoke 命令）→ 记录教训 → 标 applied，失败自动回滚',
+            'rsi-lesson — 追加/查看教训库 harness-lessons.md',
+          ].map(item),
         ),
-        React.createElement('div', null, '评分表在 rsi-plan 时记录 sha256，rsi-collect 比对后才计分；任一机器项失败即判该变体未通过。'),
-        React.createElement('div', { style: { marginTop: '6px', opacity: 0.75 } }, 'English: runs, failure evidence and reflection/digest cards are tracked under <cwd>/.rsi; review and adoption happen in conversation via rsi-run / rsi-evidence / rsi-propose / rsi-review / rsi-adopt / rsi-lesson.'),
+        line('评分表在 rsi-plan 时记录 sha256，rsi-collect 比对后才计分；正则评分项有长度/超时/嵌套量词防护。'),
+        line('English: runs, failure evidence and reflection/digest cards live under <cwd>/.rsi; review and adoption happen in conversation via the rsi-* tools.', { style: { marginTop: '6px', opacity: 0.75 } }),
       )
     }
 

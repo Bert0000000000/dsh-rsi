@@ -1,6 +1,14 @@
-import crypto from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
+import { stamp, isoNow, slug, resolveInside, pathExists, writeFileSafe, writeFileAtomic, sha256, realPathOf, readJson, readFileOrNull, listDirNames, listFiles, splitLines, normalizeRel, hasDotDotSegment } from './lib/fsx.js'
+import { compileParameters } from './lib/schema.js'
+import { EVAL_KINDS, evaluateItem, validateRubric, aggregateVariant } from './lib/rubric.js'
+import { redactSecrets, truncateEvidence, safeJson } from './lib/redact.js'
+import { HARNESS_COMPONENTS, normalizeEdits, composeHarness } from './lib/compose.js'
+import { compareDirs, renderCompareMarkdown } from './lib/compare.js'
+import { runRoot, listRuns, readRunIndex, writeRunIndex, upsertRun, runRecord, childrenOf, runMeta, archiveRun, restoreRun, readRunConfig, plannedRepeats, plannedMinPassRate } from './lib/runs.js'
+import { scanWrites } from './lib/audit.js'
 
 const name = 'rsi-toolkit'
 const inject = ['tools', 'sessions', 'workingDirectory']
@@ -9,180 +17,8 @@ function textBlock(text) {
   return { type: 'text', text }
 }
 
-function stamp() {
-  const d = new Date()
-  const p = (n) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
-}
-
-function slug(value) {
-  return String(value ?? '')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9\u4e00-\u9fa5_-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 48) || 'item'
-}
-
-function resolveInside(base, target) {
-  const resolved = path.resolve(base, target)
-  const root = path.resolve(base)
-  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-    throw new Error(`路径越界：'${target}' 不在工作区 '${base}' 内`)
-  }
-  return resolved
-}
-
-function pathExists(p) {
-  try {
-    fs.accessSync(p)
-    return true
-  } catch {
-    return false
-  }
-}
-
-function writeFileSafe(base, rel, content) {
-  const abs = resolveInside(base, rel)
-  fs.mkdirSync(path.dirname(abs), { recursive: true })
-  fs.writeFileSync(abs, content, 'utf8')
-  return abs
-}
-
-/** 原子写：先写同目录临时文件再 rename，避免半截 JSON。 */
-function writeFileAtomic(base, rel, content) {
-  const abs = resolveInside(base, rel)
-  fs.mkdirSync(path.dirname(abs), { recursive: true })
-  const tmp = abs + '.' + process.pid + '.' + Date.now() + '.tmp'
-  fs.writeFileSync(tmp, content, 'utf8')
-  try {
-    fs.renameSync(tmp, abs)
-  } catch (error) {
-    try {
-      fs.unlinkSync(tmp)
-    } catch {
-      // 临时文件清理失败不覆盖原始错误
-    }
-    throw error
-  }
-  return abs
-}
-
-function sha256(text) {
-  return crypto.createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex')
-}
-
-/** 已存在路径取 realpath；不存在时向上找到最近的已存在祖先再拼接。 */
-function realPathOf(target) {
-  let current = path.resolve(target)
-  const tail = []
-  for (let i = 0; i < 64; i += 1) {
-    try {
-      const real = fs.realpathSync.native(current)
-      return tail.length ? path.join(real, ...tail.reverse()) : real
-    } catch {
-      const parent = path.dirname(current)
-      if (parent === current) return path.resolve(target)
-      tail.push(path.basename(current))
-      current = parent
-    }
-  }
-  return path.resolve(target)
-}
-
-function readJson(p) {
-  if (!pathExists(p)) return null
-  try {
-    return JSON.parse(fs.readFileSync(p, 'utf8'))
-  } catch (error) {
-    throw new Error(`无法解析 JSON：${p}（${error.message}）`)
-  }
-}
-
-function readFileOrNull(p) {
-  try {
-    return fs.readFileSync(p, 'utf8')
-  } catch {
-    return null
-  }
-}
-
-function listDirNames(dir) {
-  try {
-    return fs.readdirSync(dir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => entry.name)
-  } catch {
-    return []
-  }
-}
-
-function listFiles(dir) {
-  try {
-    const out = []
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (entry.isFile()) out.push(entry.name)
-      else if (entry.isDirectory()) {
-        for (const sub of listFiles(path.join(dir, entry.name))) out.push(`${entry.name}/${sub}`)
-      }
-    }
-    return out
-  } catch {
-    return []
-  }
-}
-
-function splitLines(text) {
-  const lines = String(text ?? '').replace(/\r\n/g, '\n').split('\n')
-  while (lines.length && lines[lines.length - 1].trim() === '') lines.pop()
-  return lines
-}
-
-/**
- * 把作者侧参数 DSL（属性级 required: true）编译成模型端可用的 JSON Schema。
- * ctx.tools.register 的 parameters 是原始 JSON Schema，不会再做这层编译；
- * 直接把 DSL 注册出去，provider 会收到非法 schema（property 里的 required 必须是对象根上的字符串数组）。
- */
-function compilePropertyMap(spec) {
-  const properties = {}
-  const required = []
-  for (const [key, value] of Object.entries(spec ?? {})) {
-    properties[key] = compileValueSpec(value)
-    if (value && value.required === true) required.push(key)
-  }
-  return { properties, required }
-}
-
-function compileValueSpec(spec) {
-  if (!spec || typeof spec !== 'object') return spec
-  const node = {}
-  for (const [key, value] of Object.entries(spec)) {
-    if (key === 'required' || key === 'properties') continue
-    if (key === 'items') node.items = Array.isArray(value) ? value.map(compileValueSpec) : compileValueSpec(value)
-    else node[key] = value
-  }
-  if (spec.properties && typeof spec.properties === 'object') {
-    const { properties, required } = compilePropertyMap(spec.properties)
-    node.properties = properties
-    if (required.length) node.required = required
-  }
-  return node
-}
-
-function compileParameters(spec) {
-  const { properties, required } = compilePropertyMap(spec)
-  return { type: 'object', properties, ...(required.length ? { required } : {}) }
-}
-
 const ADOPT_RSI_DENY = ['bundles/', 'evidence/', 'state/', 'proposals/', 'backups/']
 
-function normalizeRel(rel) {
-  return String(rel ?? '').replace(/\\/g, '/').replace(/^\.\//, '')
-}
-
-function hasDotDotSegment(rel) {
-  return normalizeRel(rel).split('/').some((seg) => seg === '..' || seg === '.')
-}
 
 /** 白名单 + 归一化 + realpath 三重校验；任何越界一律抛错（fail-closed）。 */
 function resolveAllowedAdoptPath(cwd, rel) {
@@ -213,94 +49,11 @@ function isAllowedAdoptPath(cwd, rel) {
   }
 }
 
-const EVAL_KINDS = ['file-exists', 'line-count', 'regex-all-lines', 'regex-last-line', 'contains', 'manual']
-
-function evaluateItem(item, probeDir) {
-  if (!item || typeof item !== 'object') {
-    return { id: '', label: '', kind: 'manual', weight: 0, ok: false, detail: '评分项为空或非法，判失败' }
-  }
-  const weight = typeof item.weight === 'number' && item.weight >= 0 ? item.weight : 1
-  const base = {
-    id: item.id ?? '',
-    label: item.label ?? item.id ?? '',
-    kind: item.kind ?? 'manual',
-    weight,
-    ok: null,
-    detail: `人工评审项${item.note ? `：${item.note}` : ''}`,
-  }
-  if (item.kind === 'manual' || !item.kind) return base
-  if (!EVAL_KINDS.includes(item.kind)) {
-    return { ...base, ok: false, detail: `未知 kind '${item.kind}'，判失败（合法值：${EVAL_KINDS.join(' | ')}）` }
-  }
-  const target = item.path ? resolveInside(probeDir, item.path) : null
-  const missing = { ...base, ok: false, detail: `文件缺失：${item.path ?? '(无 path)'}` }
-  if (item.kind === 'file-exists') {
-    if (!target || !pathExists(target)) return { ...base, ok: false, detail: `文件缺失：${item.path}` }
-    let size = 0
-    try {
-      size = fs.statSync(target).size
-    } catch {
-      size = 0
-    }
-    if (size === 0) return { ...base, ok: false, detail: `文件为空（0 字节）：${item.path}` }
-    if ((readFileOrNull(target) ?? '').trim() === '') return { ...base, ok: false, detail: `文件只有空白字符：${item.path}` }
-    return { ...base, ok: true, detail: `文件存在（${size} 字节）：${item.path}` }
-  }
-  if (!target || !pathExists(target)) return missing
-  const content = readFileOrNull(target) ?? ''
-  if (content.trim() === '') {
-    return { ...base, ok: false, detail: `文件为空（0 非空字符）：${item.path}` }
-  }
-  if (item.kind === 'line-count') {
-    const n = splitLines(content).length
-    const ok = (item.min == null || n >= item.min) && (item.max == null || n <= item.max)
-    return { ...base, ok, detail: `${item.path} 共 ${n} 行（要求 ${item.min ?? '-'}~${item.max ?? '-'}）` }
-  }
-  let re
-  try {
-    re = new RegExp(item.pattern ?? '')
-  } catch {
-    return { ...base, ok: false, detail: `正则无效：${item.pattern}` }
-  }
-  if (item.kind === 'regex-all-lines') {
-    const lines = splitLines(content)
-    const bad = lines.filter((line) => !re.test(line)).length
-    return { ...base, ok: bad === 0, detail: `${lines.length} 行中 ${bad} 行不匹配 /${item.pattern}/` }
-  }
-  if (item.kind === 'regex-last-line') {
-    const lines = splitLines(content)
-    const last = lines[lines.length - 1] ?? ''
-    return { ...base, ok: re.test(last), detail: `末行${re.test(last) ? '' : '不'}匹配 /${item.pattern}/` }
-  }
-  if (item.kind === 'contains') {
-    const ok = content.includes(String(item.pattern ?? ''))
-    return { ...base, ok, detail: ok ? `找到片段：${item.pattern}` : `未找到片段：${item.pattern}` }
-  }
-  return { ...base, ok: false, detail: `未知 kind '${item.kind}'，判失败` }
-}
-
-function validateRubric(rubric) {
-  if (!rubric || typeof rubric !== 'object' || !Array.isArray(rubric.items) || !rubric.items.length) {
-    throw new Error('rubric 必须包含至少一个评分项（items[] 非空）')
-  }
-  if (rubric.passScore != null) {
-    if (!Number.isFinite(rubric.passScore) || rubric.passScore <= 0) {
-      throw new Error(`rubric.passScore 必须是大于 0 的有限数字，收到：${JSON.stringify(rubric.passScore)}`)
-    }
-  }
-  rubric.items.forEach((item, index) => {
-    if (!item || typeof item !== 'object') throw new Error(`评分项 #${index + 1} 非法`)
-    if (item.kind != null && !EVAL_KINDS.includes(item.kind)) {
-      throw new Error(`评分项 #${index + 1} 的 kind '${item.kind}' 未知（合法值：${EVAL_KINDS.join(' | ')}）`)
-    }
-  })
-  return rubric
-}
 
 function planTool() {
   return {
     name: 'rsi-plan',
-    description: '创建一轮 RSI Propose 实验：给定统一任务 T 和多个候选 harness 变体，落盘任务/评分表/变体文件，并返回每个变体的 probe 子代理启动指令。本工具只写文件、不启动子代理；模型须按返回的 instructions 用 subagent 工具逐个启动全新子代理。',
+    description: '创建一轮 RSI Propose 实验：给定统一任务 T 与多个候选 harness 变体（可整份 harness，也可按 8 个组件分解为 edits），落盘任务/评分表/变体与重复执行目录，返回每个 probe 的启动指令。本工具只写文件、不启动子代理。',
     parameters: {
       cwd: { type: 'string', required: true, description: '工作区绝对路径；本工具的所有写入只发生在 cwd 内' },
       runId: { type: 'string', description: '实验 id（kebab-case，默认 r<时间戳>）' },
@@ -308,12 +61,23 @@ function planTool() {
       variants: {
         type: 'array',
         required: true,
-        description: '候选 harness 变体列表',
+        description: '候选 harness 变体列表（label 必须唯一）',
         items: {
           type: 'object',
           properties: {
             label: { type: 'string', description: '变体名（如 baseline、候选规则 A）' },
-            harness: { type: 'string', description: '该变体的 harness 规则全文；基线可写「无附加规则」' },
+            harness: { type: 'string', description: '该变体的 harness 规则全文；与 edits 二选一，edits 优先' },
+            edits: {
+              type: 'array',
+              description: '按组件分解的改动（B3）；给出后 harness 由这些组件合成',
+              items: {
+                type: 'object',
+                properties: {
+                  component: { type: 'string', description: '组件：' + HARNESS_COMPONENTS.join(' | ') },
+                  change: { type: 'string', description: '该组件的具体改动' },
+                },
+              },
+            },
           },
         },
       },
@@ -321,7 +85,8 @@ function planTool() {
         type: 'object',
         description: '评分表（缺省生成单个人工评审项）',
         properties: {
-          passScore: { type: 'number', description: '及格分（加权分数）' },
+          passScore: { type: 'number', description: '及格分（加权分数，每次重复单独判定）' },
+          minPassRate: { type: 'number', description: '变体通过所需的重复通过率（0~1，默认 1）' },
           items: {
             type: 'array',
             description: '评分项',
@@ -330,18 +95,26 @@ function planTool() {
               properties: {
                 id: { type: 'string' },
                 label: { type: 'string' },
-                kind: { type: 'string', description: 'file-exists | line-count | regex-all-lines | regex-last-line | contains | manual' },
+                kind: { type: 'string', description: 'file-exists | line-count | regex-all-lines | regex-last-line | contains | command | manual' },
                 weight: { type: 'number' },
                 path: { type: 'string', description: '相对 probe 目录的文件路径' },
                 pattern: { type: 'string' },
                 min: { type: 'number' },
                 max: { type: 'number' },
                 note: { type: 'string' },
+                run: { type: 'string', description: 'command 类型：在 probe 目录执行的命令（shell）' },
+                expectExit: { type: 'number', description: 'command 类型：期望退出码（默认 0）' },
+                timeoutMs: { type: 'number', description: 'command 类型：超时毫秒（默认 10000，最大 60000）' },
               },
             },
           },
         },
       },
+      repeats: { type: 'number', description: '每个变体重复执行次数（1~9，默认 3；B1 统计判定需要 ≥3）' },
+      mode: { type: 'string', enum: ['parallel', 'sequential'], description: 'probe 启动模式（默认 parallel）' },
+      budget: { type: 'number', description: '本次实验最多允许的 probe 次数（默认 24；变体数×重复次数不得超出）' },
+      minPassRate: { type: 'number', description: '变体通过所需的重复通过率（0~1，默认取 rubric.minPassRate 或 1）' },
+      parent: { type: 'string', description: '父代实验 id（B6 血缘）' },
     },
     output: {
       schema: {
@@ -351,10 +124,12 @@ function planTool() {
           runId: { type: 'string' },
           runDir: { type: 'string' },
           labels: { type: 'array', items: { type: 'string' } },
+          repeats: { type: 'number' },
+          totalProbes: { type: 'number' },
           instructions: { type: 'string' },
         },
       },
-      render: (args, value) => [textBlock(`实验 ${value.runId} 已创建。\n${value.instructions}`)],
+      render: (args, value) => [textBlock(`实验 ${value.runId} 已创建（${value.labels.length} 变体 × ${value.repeats} 次 = ${value.totalProbes} 个 probe）。\n${value.instructions}`)],
     },
     timeoutMs: 60000,
     async execute(args) {
@@ -368,43 +143,99 @@ function planTool() {
       if (!/^[a-z0-9][a-z0-9-]*$/.test(runId)) throw new Error(`runId 无效：${runId}`)
       const runDir = resolveInside(cwd, path.join('.rsi', 'runs', runId))
       if (pathExists(runDir)) throw new Error(`runId 已存在：${runId}`)
-
-      fs.mkdirSync(runDir, { recursive: true })
-      writeFileSafe(cwd, path.join('.rsi', 'runs', runId, 'task.md'), `# 任务 T\n\n${task}\n`)
+      const repeats = Math.max(1, Math.min(9, Math.floor(Number(args.repeats ?? 3)) || 3))
+      const mode = args.mode === 'sequential' ? 'sequential' : 'parallel'
+      const totalProbes = variants.length * repeats
+      const rawBudget = Number(args.budget)
+      const budget = Number.isFinite(rawBudget) && rawBudget > 0 ? Math.floor(rawBudget) : 24
+      if (totalProbes > budget) {
+        throw new Error(`预算不足：${variants.length} 个变体 × ${repeats} 次 = ${totalProbes} 次 probe，超过 budget=${budget}（调大 budget 或减少 repeats）`)
+      }
+      const parent = String(args.parent ?? '').trim()
+      if (parent && !pathExists(path.join(runRoot(cwd), parent))) throw new Error(`父代实验不存在：${parent}`)
       const rubric = args.rubric && typeof args.rubric === 'object' && Array.isArray(args.rubric.items)
         ? args.rubric
         : { passScore: null, items: [{ id: 'overall', label: '总体完成度', kind: 'manual', weight: 1, note: '人工评审' }] }
       validateRubric(rubric)
+      const rawRate = Number(args.minPassRate ?? rubric.minPassRate ?? 1)
+      const minPassRate = Number.isFinite(rawRate) && rawRate > 0 && rawRate <= 1 ? rawRate : 1
+      const prepared = []
+      const seen = new Set()
+      variants.forEach((variant, index) => {
+        const label = slug(variant?.label || `v${index + 1}`)
+        if (seen.has(label)) throw new Error(`变体 label 重复：${label}`)
+        seen.add(label)
+        const edits = Array.isArray(variant?.edits) ? normalizeEdits(variant.edits) : []
+        prepared.push({ index, label, edits, harnessText: composeHarness({ harness: variant?.harness, edits }) })
+      })
       const rubricText = JSON.stringify(rubric, null, 2) + '\n'
+      fs.mkdirSync(runDir, { recursive: true })
+      writeFileSafe(cwd, path.join('.rsi', 'runs', runId, 'task.md'), `# 任务 T\n\n${task}\n`)
       writeFileSafe(cwd, path.join('.rsi', 'runs', runId, 'rubric.json'), rubricText)
       writeFileSafe(cwd, path.join('.rsi', 'runs', runId, 'config.json'), JSON.stringify({
         cwd,
         runId,
-        createdAt: new Date().toISOString(),
+        createdAt: isoNow(),
         variantCount: variants.length,
+        repeats,
+        minPassRate,
+        mode,
+        budget,
+        totalProbes,
+        parent,
         rubricSha256: sha256(rubricText),
-        rubricRuleVersion: 2,
+        rubricRuleVersion: 3,
+        meta: runMeta(cwd),
       }, null, 2) + '\n')
-
-      const labels = []
-      const blocks = [`# RSI 实验 ${runId}\n\n运行目录：${runDir}\n`]
-      variants.forEach((variant, index) => {
-        const label = slug(variant?.label || `v${index + 1}`)
-        labels.push(label)
-        const num = String(index + 1)
-        const variantDir = path.join(runDir, 'variants', `${num}-${label}`)
-        fs.mkdirSync(variantDir, { recursive: true })
-        fs.writeFileSync(path.join(variantDir, 'harness.md'), `# 候选 harness：${variant?.label ?? label}\n\n${String(variant?.harness ?? '')}\n`, 'utf8')
-        const probeDir = path.join(runDir, 'probes', `${num}-${label}`)
-        fs.mkdirSync(probeDir, { recursive: true })
-        const harnessText = String(variant?.harness ?? '').trim() || '无附加规则（基线）'
-        blocks.push(
-          `## 变体 ${num}：${label}\n\n1. 启动一个全新 subagent（不用 fork，不带任何本会话的 harness 建议）。\n2. 原样发送任务文本：\n\n---\n${task}\n---\n\n3. 单独告知它的 harness 约束：\n\n---\n${harnessText}\n---\n\n4. 要求它：全部产出与最终报告写入 ${probeDir} 目录；除该目录外不得创建或修改任何文件；不读不写 .rsi 之外的任何配置。\n`
-        )
+      upsertRun(cwd, {
+        runId,
+        parent,
+        planTs: isoNow(),
+        variants: prepared.map((item) => item.label),
+        repeats,
+        mode,
+        budget,
+        archived: false,
       })
-      blocks.push(`\n完成后调用 rsi-collect（cwd=${cwd}，runId=${runId}）汇总评分。`)
+      const blocks = [`# RSI 实验 ${runId}\n\n运行目录：${runDir}\n\n- 变体：${prepared.length} 个\n- 重复：每个变体 ${repeats} 次（共 ${totalProbes} 个 probe）\n- 模式：${mode}\n- 预算：${budget} 次\n- 父代：${parent || '（无）'}\n`]
+      blocks.push(mode === 'parallel'
+        ? '启动模式：parallel —— 下面的 probe 可同时启动（各自独立子代理）。'
+        : '启动模式：sequential —— 按顺序逐个启动，前一个结束后再启动下一个。')
+      prepared.forEach((item) => {
+        const num = String(item.index + 1)
+        const variantDir = path.join(runDir, 'variants', `${num}-${item.label}`)
+        fs.mkdirSync(variantDir, { recursive: true })
+        fs.writeFileSync(path.join(variantDir, 'harness.md'), `# 候选 harness：${item.label}\n\n${item.harnessText || '无附加规则（基线）'}\n`, 'utf8')
+        if (item.edits.length) {
+          fs.writeFileSync(path.join(variantDir, 'edits.json'), JSON.stringify(item.edits, null, 2) + '\n', 'utf8')
+        }
+        for (let repeat = 1; repeat <= repeats; repeat += 1) {
+          const probeDir = repeats > 1
+            ? path.join(runDir, 'probes', `${num}-${item.label}`, 'r' + repeat)
+            : path.join(runDir, 'probes', `${num}-${item.label}`)
+          fs.mkdirSync(probeDir, { recursive: true })
+          blocks.push([
+            `## 变体 ${num}：${item.label} · 第 ${repeat}/${repeats} 次`,
+            '',
+            '1. 启动一个全新 subagent（不用 fork，不带任何本会话的 harness 建议）。',
+            '2. 原样发送任务文本：',
+            '',
+            '---',
+            task,
+            '---',
+            '3. 单独告知它的 harness 约束：',
+            '',
+            '---',
+            item.harnessText || '无附加规则（基线）',
+            '---',
+            `4. 要求它：全部产出与最终报告写入 ${probeDir} 目录；除该目录外不得创建或修改任何文件；不读不写 .rsi 之外的任何配置。`,
+            '',
+          ].join('\n'))
+        }
+      })
+      blocks.push(`\n完成后调用 rsi-collect（cwd=${cwd}，runId=${runId}）汇总评分；需要成对比较时用 rsi-compare。`)
       const instructions = blocks.join('\n')
-      return { runId, runDir, labels, instructions }
+      return { runId, runDir, labels: prepared.map((item) => item.label), repeats, totalProbes, instructions }
     },
   }
 }
@@ -412,11 +243,10 @@ function planTool() {
 function collectTool() {
   return {
     name: 'rsi-collect',
-    description: '汇总一轮 RSI 实验：按 rubric.json 对每个 probe 变体的产出做机器评分，生成 report.md/report.json，返回各变体得分对比。',
+    description: '汇总一轮 RSI 实验：按 rubric.json 对每个变体的每次重复执行（r1..rN）做机器评分，按 passRate/均值判定变体是否通过，生成 report.md/report.json。评分表只能来自实验目录并校验创建时哈希。',
     parameters: {
       cwd: { type: 'string', required: true, description: '工作区绝对路径' },
       runId: { type: 'string', required: true, description: '实验 id' },
-      // 评分表只能来自 runs/<runId>/rubric.json（并校验创建时的 sha256），不接受调用方覆盖
     },
     output: {
       schema: {
@@ -432,13 +262,15 @@ function collectTool() {
           passScore: { type: 'number' },
           hasPassScore: { type: 'boolean' },
           passed: { type: 'boolean' },
+          repeats: { type: 'number' },
+          minPassRate: { type: 'number' },
           rubricHashVerified: { type: 'boolean' },
           failedVariants: { type: 'array', items: { type: 'string' } },
         },
       },
-      render: (args, value) => [textBlock(`汇总完成：${value.hasPassScore ? (value.passed ? '全部变体通过' : `未全部通过（${value.failedVariants.join('、') || '无有效变体'}）`) : '待人工评审'}（总分 ${value.total}/${value.maxTotal}，评分表哈希${value.rubricHashVerified ? '已校验' : '未校验（旧实验）'}）\n报告：${value.reportPath}`)],
+      render: (args, value) => [textBlock(`汇总完成：${value.hasPassScore ? (value.passed ? '全部变体通过' : `未全部通过（${value.failedVariants.join('、') || '无有效变体'}）`) : '待人工评审'}（总分 ${value.total}/${value.maxTotal}，重复 ${value.repeats} 次，要求通过率 ≥ ${value.minPassRate}，评分表哈希${value.rubricHashVerified ? '已校验' : '未校验（旧实验）'}）\n报告：${value.reportPath}`)],
     },
-    timeoutMs: 60000,
+    timeoutMs: 120000,
     async execute(args) {
       const cwd = path.resolve(String(args.cwd ?? ''))
       const runId = String(args.runId ?? '').trim()
@@ -472,56 +304,57 @@ function collectTool() {
         }
         rubricHashVerified = true
       }
+      const repeats = plannedRepeats(config)
+      const minPassRate = plannedMinPassRate(config)
       const variantDirs = listDirNames(path.join(runDir, 'variants')).sort()
       if (!variantDirs.length) throw new Error('没有任何 variants 目录')
-      const probeNames = new Set(listDirNames(path.join(runDir, 'probes')))
       const hasPassScore = Number.isFinite(rubric.passScore) && rubric.passScore > 0
       const passScore = hasPassScore ? rubric.passScore : 0
       const variants = []
       const manualItems = []
       for (const dirName of variantDirs) {
-        const probeDir = path.join(runDir, 'probes', dirName)
         const label = dirName.replace(/^\d+-/, '')
-        const probeExists = probeNames.has(dirName) && pathExists(probeDir)
-        const rows = rubric.items.map((item) => {
-          const safeItem = item && typeof item === 'object' ? item : {}
-          if (probeExists) return evaluateItem(safeItem, probeDir)
-          const manual = safeItem.kind == null || safeItem.kind === 'manual'
-          return {
-            id: safeItem.id ?? '',
-            label: safeItem.label ?? safeItem.id ?? '',
-            kind: safeItem.kind ?? 'manual',
-            weight: typeof safeItem.weight === 'number' && safeItem.weight >= 0 ? safeItem.weight : 1,
-            ok: manual ? null : false,
-            detail: 'probe 目录缺失，判 0 分',
-          }
+        const aggregate = aggregateVariant({
+          label,
+          dirName,
+          probeDir: path.join(runDir, 'probes', dirName),
+          plannedRepeats: repeats,
+          items: rubric.items,
+          passScore,
+          hasPassScore,
+          minPassRate,
         })
-        let score = 0
-        let max = 0
-        let failed = 0
-        for (const row of rows) {
-          if (row.kind == null || row.kind === 'manual') {
-            if (row.ok === null) manualItems.push(`[${label}] ${row.label || row.id || ''}`)
-            continue
-          }
-          max += row.weight
-          if (row.ok === true) score += row.weight
-          else failed += 1
-        }
-        // 任一机器评分项失败即判该变体未通过：passScore 只是分数门槛，不能掩盖漏交付
-        const variantPassed = hasPassScore ? score >= passScore && failed === 0 : null
-        variants.push({ label, dir: dirName, probeExists, score, max, failed, passed: variantPassed, rows })
+        manualItems.push(...aggregate.manualItems)
+        variants.push(aggregate)
       }
-      const total = variants.reduce((acc, v) => acc + v.score, 0)
-      const maxTotal = variants.reduce((acc, v) => acc + v.max, 0)
-      const failedVariants = variants.filter((v) => v.passed !== true).map((v) => v.label)
-      const strictRule = '任一机器评分项失败即判该变体未通过（passScore 只作分数门槛）'
-      const passed = hasPassScore && variants.length > 0 && variants.every((v) => v.passed === true)
-      const lines = ['# RSI 实验汇总', '', `runId: ${runId}`, `评分表哈希：${rubricHashVerified ? '已校验 ' : '未校验（旧实验无记录） '}${rubricSha256}`, `判定规则：${strictRule}`, '']
-      for (const v of variants) {
-        lines.push(`## ${v.label} — ${v.score}/${v.max}${v.passed === true ? ' ✅ 通过' : v.passed === false ? ' ❌ 未通过' : ''}${v.probeExists ? '' : '（probe 目录缺失）'}`, '')
+      const total = variants.reduce((acc, value) => acc + value.score, 0)
+      const maxTotal = variants.reduce((acc, value) => acc + value.max, 0)
+      const failedVariants = variants.filter((value) => value.passed !== true).map((value) => value.label)
+      const strictRule = '每次重复中任一机器评分项失败即判该次未通过；变体需执行齐全部重复、passRate ≥ 要求且均值 ≥ passScore'
+      const passed = hasPassScore && variants.length > 0 && variants.every((value) => value.passed === true)
+      const lines = [
+        '# RSI 实验汇总',
+        '',
+        `runId: ${runId}`,
+        `重复次数：${repeats}（要求通过率 ≥ ${minPassRate}）`,
+        `评分表哈希：${rubricHashVerified ? '已校验 ' : '未校验（旧实验无记录） '}${rubricSha256}`,
+        `判定规则：${strictRule}`,
+        '',
+      ]
+      for (const variant of variants) {
+        const verdict = variant.passed === true ? ' ✅ 通过' : variant.passed === false ? ' ❌ 未通过' : ''
+        lines.push(
+          `## ${variant.label} — 均分 ${variant.score}/${variant.max}（通过率 ${variant.passRate}，执行 ${variant.executed}/${variant.repeats}）${verdict}`,
+          '',
+          '| 次数 | 执行 | 得分 | 未通过项 | 本次判定 |',
+          '| --- | --- | --- | --- | --- |',
+        )
+        for (const row of variant.repeatRows) {
+          lines.push(`| 第 ${row.index} 次 | ${row.executed ? '是' : '否'} | ${row.score}/${row.max} | ${row.failed} | ${row.executed ? (row.passed ? '通过' : '未通过') : '未产出'} |`)
+        }
+        lines.push('', `- 分数：均值 ${variant.mean}、标准差 ${variant.stdev}、逐次 [${variant.scores.join(', ')}]`, '')
         lines.push('| 评分项 | 结果 | 说明 |', '| --- | --- | --- |')
-        for (const row of v.rows) {
+        for (const row of variant.rows) {
           lines.push(`| ${row.label || row.id || '-'} | ${row.ok === true ? '✅' : row.ok === false ? '❌' : '👤 人工'} | ${String(row.detail ?? '').replace(/\|/g, '\\|')} |`)
         }
         lines.push('')
@@ -530,10 +363,73 @@ function collectTool() {
       if (manualItems.length) lines.push('## 待人工评审', '', ...manualItems.map((m) => `- ${m}`), '')
       const reportPath = path.join(runDir, 'report.md')
       fs.writeFileSync(reportPath, lines.join('\n'), 'utf8')
-      fs.writeFileSync(path.join(runDir, 'report.json'), JSON.stringify({ runId, passScore, hasPassScore, total, maxTotal, passed, rubricSha256, rubricHashVerified, failedVariants, variants, manualItems }, null, 2) + '\n', 'utf8')
-      return { runId, variants, manualItems, reportPath, maxTotal, total, passScore, hasPassScore, passed, rubricHashVerified, failedVariants }
+      fs.writeFileSync(path.join(runDir, 'report.json'), JSON.stringify({
+        runId,
+        passScore,
+        hasPassScore,
+        repeats,
+        minPassRate,
+        total,
+        maxTotal,
+        passed,
+        rubricSha256,
+        rubricHashVerified,
+        failedVariants,
+        variants,
+        manualItems,
+      }, null, 2) + '\n', 'utf8')
+      return { runId, variants, manualItems, reportPath, maxTotal, total, passScore, hasPassScore, passed, repeats, minPassRate, rubricHashVerified, failedVariants }
     },
   }
+}
+
+/** C1：采纳后的冒烟校验（语法/JSON/非空 + 可选自定义命令），失败即触发回滚。 */
+function runAdoptSmoke(cwd, changed, smoke) {
+  const details = []
+  for (const rel of changed) {
+    const abs = path.join(cwd, rel)
+    if (/\.(mjs|cjs|js)$/i.test(rel)) {
+      const result = spawnSync(process.execPath, ['--check', abs], { encoding: 'utf8', timeout: 15000, windowsHide: true })
+      if (result.error) {
+        if (result.error.code === 'ENOENT') {
+          details.push(`${rel}: 跳过语法检查（node 不可用）`)
+          continue
+        }
+        throw new Error(`冒烟校验失败：${rel} 无法执行 node --check —— ${result.error.message}`)
+      }
+      if (result.status !== 0) {
+        const message = (String(result.stderr ?? '') + String(result.stdout ?? '')).trim().slice(0, 400)
+        throw new Error(`冒烟校验失败：${rel} 语法错误 —— ${message}`)
+      }
+      details.push(`${rel}: node --check 通过`)
+      continue
+    }
+    if (/\.json$/i.test(rel)) {
+      try {
+        JSON.parse(fs.readFileSync(abs, 'utf8'))
+      } catch (error) {
+        throw new Error(`冒烟校验失败：${rel} 不是合法 JSON —— ${error instanceof Error ? error.message : String(error)}`)
+      }
+      details.push(`${rel}: JSON 解析通过`)
+      continue
+    }
+    const text = readFileOrNull(abs) ?? ''
+    if (!text.trim()) throw new Error(`冒烟校验失败：${rel} 内容为空`)
+    details.push(`${rel}: 非空检查通过`)
+  }
+  const command = String(smoke?.command ?? '').trim()
+  if (command) {
+    const timeoutMs = Math.max(1000, Math.min(120000, Math.floor(Number(smoke?.timeoutMs ?? 30000)) || 30000))
+    const result = spawnSync(command, { cwd, shell: true, timeout: timeoutMs, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, windowsHide: true })
+    if (result.error && result.error.code === 'ETIMEDOUT') throw new Error(`冒烟命令超时（${timeoutMs}ms）：${command}`)
+    if (result.error) throw new Error(`冒烟命令无法执行：${command}（${result.error.message}）`)
+    if (result.status !== 0) {
+      const output = (String(result.stdout ?? '') + String(result.stderr ?? '')).trim().slice(0, 400)
+      throw new Error(`冒烟命令失败（退出码 ${result.status}）：${command}${output ? '；输出：' + output : ''}`)
+    }
+    details.push(`smoke: ${command} → 退出码 0`)
+  }
+  return details
 }
 
 function adoptTool() {
@@ -561,6 +457,14 @@ function adoptTool() {
       patch: { type: 'string', description: 'preset-bundle 模式的完整 cordis.patch.yml 内容' },
       rowId: { type: 'string', description: 'preset-bundle 模式 Loader 行 id（如 preset-<id>）' },
       proposalId: { type: 'string', description: '关联提案 ID（采纳成功后自动把该提案标记为 applied）' },
+      smoke: {
+        type: 'object',
+        description: '采纳后冒烟校验（C1）：写入的 .js 用 node --check、.json 解析、其余非空；可选 command 在 cwd 执行，任一失败自动回滚',
+        properties: {
+          command: { type: 'string', description: '自定义冒烟命令（退出码必须为 0）' },
+          timeoutMs: { type: 'number', description: '命令超时毫秒（默认 30000，最大 120000）' },
+        },
+      },
     },
     output: {
       schema: {
@@ -637,7 +541,9 @@ function adoptTool() {
           }
           restoreLessons()
         }
+        let smokeDetails = []
         try {
+          smokeDetails = runAdoptSmoke(cwd, changed, args.smoke)
           appendLesson('workspace', changed)
           markProposalApplied(cwd, proposal.id)
         } catch (error) {
@@ -649,7 +555,7 @@ function adoptTool() {
           changed,
           backupDir,
           bundleDir: '',
-          note: `已采纳 ${changed.length} 个文件改动；原文件备份在 ${backupDir}；决策已追加到 .rsi/memory/harness-lessons.md；提案 ${proposal.id} 已标记 applied`,
+          note: `已采纳 ${changed.length} 个文件改动；冒烟校验 ${smokeDetails.length} 项通过；原文件备份在 ${backupDir}；决策已追加到 .rsi/memory/harness-lessons.md；提案 ${proposal.id} 已标记 applied`,
         }
       }
       const bundleName = slug(String(args.name ?? 'rsi-preset'))
@@ -737,7 +643,7 @@ function statusTool() {
     async execute(args) {
       const cwd = path.resolve(String(args.cwd ?? ''))
       const dir = path.join(cwd, '.rsi')
-      const runs = listDirNames(path.join(dir, 'runs'))
+      const runs = listDirNames(path.join(dir, 'runs')).filter((name) => name !== '_archive')
       const lessonsPath = path.join(dir, 'memory', 'harness-lessons.md')
       const lessonLines = splitLines(readFileOrNull(lessonsPath) ?? '').length
       const backupCount = listDirNames(path.join(dir, 'backups')).length
@@ -764,18 +670,6 @@ const EVIDENCE_MAX_LINES = 200
 const EVIDENCE_MAX_BYTES = 200 * 1024
 const EVIDENCE_TRUNCATE = 500
 
-function safeJson(value) {
-  try {
-    return JSON.stringify(value)
-  } catch {
-    return '[无法序列化]'
-  }
-}
-
-function truncateEvidence(value) {
-  const s = String(value ?? '')
-  return s.length > EVIDENCE_TRUNCATE ? `${s.slice(0, EVIDENCE_TRUNCATE)}…(截断,共${s.length}字符)` : s
-}
 
 function sessionIdOf(value) {
   if (!value) return null
@@ -794,7 +688,7 @@ function pickArguments(value) {
   for (const key of ordered.slice(0, 8)) {
     const raw = value[key]
     const text = typeof raw === 'string' ? raw : safeJson(raw)
-    out[key] = text.length > 200 ? text.slice(0, 200) + '…' : text
+    out[key] = redactSecrets(text.length > 200 ? text.slice(0, 200) + '…' : text)
   }
   return out
 }
@@ -844,9 +738,6 @@ const PROPOSAL_STATUSES = ['draft', 'approved', 'rejected', 'applied']
 const REFLECT_THRESHOLD = 3
 const REFLECT_MIN_GAP_MS = 5 * 60 * 1000
 
-function isoNow() {
-  return new Date().toISOString()
-}
 
 function proposalIndexPath(cwd) {
   return path.join(cwd, '.rsi', 'proposals', 'index.json')
@@ -1322,10 +1213,6 @@ function proposeTool() {
 const DIGEST_THRESHOLD = 3
 const DIGEST_WINDOW = 200
 
-function runRoot(cwd) {
-  return path.join(cwd, '.rsi', 'runs')
-}
-
 function probeStateOf(dir) {
   const files = listFiles(dir)
   if (!files.length) return { status: 'empty', files }
@@ -1333,12 +1220,35 @@ function probeStateOf(dir) {
   return { status: hasResult ? 'done' : 'partial', files }
 }
 
+/** 每次重复执行的产出状态（r1..rN）；旧布局没有 r<k> 时按单次处理。 */
+function repeatProgress(dir, repeats) {
+  const nested = listDirNames(dir).filter((name) => /^r\d+$/.test(name))
+  if (!nested.length) {
+    const legacy = probeStateOf(dir)
+    return [{ repeat: 1, status: legacy.status, files: legacy.files.length }]
+  }
+  const out = []
+  for (let index = 1; index <= repeats; index += 1) {
+    const files = listFiles(path.join(dir, 'r' + index))
+    out.push({ repeat: index, status: files.length ? 'done' : 'empty', files: files.length })
+  }
+  return out
+}
+
 function summarizeRun(cwd, runId) {
   const dir = path.join(runRoot(cwd), runId)
+  const config = readRunConfig(cwd, runId)
+  const repeats = plannedRepeats(config)
+  const record = runRecord(cwd, runId) || {}
   const variants = listDirNames(path.join(dir, 'variants'))
   const probes = listDirNames(path.join(dir, 'probes')).map((variant) => {
-    const state = probeStateOf(path.join(dir, 'probes', variant))
-    return { variant, status: state.status, files: state.files }
+    const progress = repeatProgress(path.join(dir, 'probes', variant), repeats)
+    return {
+      variant,
+      repeats: progress,
+      done: progress.filter((item) => item.status === 'done').length,
+      total: progress.length,
+    }
   })
   const reportPath = path.join(dir, 'report.json')
   let score = null
@@ -1365,15 +1275,26 @@ function summarizeRun(cwd, runId) {
       score = null
     }
   }
+  const done = probes.reduce((acc, probe) => acc + probe.done, 0)
+  const totalProbes = probes.reduce((acc, probe) => acc + probe.total, 0)
   return {
     dir,
+    config,
+    repeats,
+    mode: String(config.mode ?? 'parallel'),
+    budget: Number.isFinite(Number(config.budget)) ? Number(config.budget) : 0,
+    parent: String(record.parent ?? config.parent ?? ''),
+    archived: record.archived === true,
+    meta: config.meta && typeof config.meta === 'object' ? config.meta : {},
     variants,
     probes,
-    done: probes.filter((probe) => probe.status === 'done').length,
+    done,
+    totalProbes,
     hasReport: pathExists(reportPath),
     score,
     maxTotal,
     verdict,
+    children: childrenOf(cwd, runId),
   }
 }
 
@@ -1381,13 +1302,13 @@ function stripHeading(text) {
   return String(text ?? '').replace(/^#[^\n]*\n+/, '').trim()
 }
 
-function probeLaunch(cwd, runId, variant) {
+function probeLaunch(cwd, runId, variant, repeat, repeats) {
   const dir = path.join(runRoot(cwd), runId)
   const task = stripHeading(readFileOrNull(path.join(dir, 'task.md')) ?? '')
   const harness = stripHeading(readFileOrNull(path.join(dir, 'variants', variant, 'harness.md')) ?? '') || '无附加规则（基线）'
-  const probeDir = path.join(dir, 'probes', variant)
+  const probeDir = repeats > 1 ? path.join(dir, 'probes', variant, 'r' + repeat) : path.join(dir, 'probes', variant)
   return [
-    '## 待补跑：' + variant,
+    '## 待补跑：' + variant + (repeats > 1 ? '（第 ' + repeat + '/' + repeats + ' 次）' : ''),
     '',
     '1. 启动一个全新 subagent（不用 fork，不带本会话的 harness 建议）。',
     '2. 原样发送任务文本：',
@@ -1407,7 +1328,7 @@ function probeLaunch(cwd, runId, variant) {
 function runTool() {
   return {
     name: 'rsi-run',
-    description: 'RSI 实验状态机：扫描 <cwd>/.rsi/runs 下每个变体与 probe 的产出，报告 probe 是否已产出、评分是否已汇总，并给出补跑指令。只读，不启动子代理。',
+    description: 'RSI 实验状态机：扫描 <cwd>/.rsi/runs 下每个变体与重复执行（r1..rN）的产出，报告进度、预算、模式、父代血缘与评分状态，并给出补跑指令。只读，不启动子代理。',
     parameters: {
       cwd: { type: 'string', required: true, description: '工作区绝对路径' },
       runId: { type: 'string', description: '实验 id（省略则汇总全部实验）' },
@@ -1434,7 +1355,7 @@ function runTool() {
       const root = runRoot(cwd)
       const rawRun = String(args.runId ?? '').trim()
       const wanted = rawRun ? slug(rawRun) : ''
-      const ids = wanted ? listDirNames(root).filter((id) => id === wanted || id.includes(wanted)) : listDirNames(root)
+      const ids = wanted ? listRuns(cwd).filter((id) => id === wanted || id.includes(wanted)) : listRuns(cwd)
       if (!ids.length) {
         return { dir: root, runId: wanted, runs: [], probes: [], instructions: '', note: wanted ? '未找到实验：' + wanted : '还没有实验：先用 rsi-plan 创建一轮 Propose 实验。' }
       }
@@ -1443,9 +1364,15 @@ function runTool() {
         return {
           runId: id,
           variantCount: summary.variants.length,
-          probeCount: summary.probes.length,
+          probeCount: summary.totalProbes,
           done: summary.done,
-          missing: summary.probes.filter((probe) => probe.status !== 'done').map((probe) => probe.variant),
+          repeats: summary.repeats,
+          mode: summary.mode,
+          budget: summary.budget,
+          parent: summary.parent,
+          children: summary.children,
+          archived: summary.archived,
+          missing: summary.probes.filter((probe) => probe.done < probe.total).map((probe) => probe.variant),
           hasReport: summary.hasReport,
           score: summary.score,
           maxTotal: summary.maxTotal,
@@ -1453,25 +1380,249 @@ function runTool() {
         }
       })
       const detail = wanted && runs.length === 1 ? summarizeRun(cwd, runs[0].runId) : null
-      const pending = detail ? detail.probes.filter((probe) => probe.status !== 'done').map((probe) => probe.variant) : []
-      const instructions = detail ? pending.map((variant) => probeLaunch(cwd, runs[0].runId, variant)).join('\n\n') : ''
+      const pending = detail
+        ? detail.probes.flatMap((probe) => probe.repeats
+          .filter((item) => item.status !== 'done')
+          .map((item) => ({ variant: probe.variant, repeat: item.repeat })))
+        : []
+      const instructions = detail
+        ? pending.map((item) => probeLaunch(cwd, runs[0].runId, item.variant, item.repeat, detail.repeats)).join('\n\n')
+        : ''
       const lines = runs.map((run) => {
         const score = run.hasReport ? '已评分 ' + (run.score ?? '?') + '/' + (run.maxTotal ?? '?') + (run.verdict ? '（' + run.verdict + '）' : '') : '未评分'
-        return '- ' + run.runId + '：变体 ' + run.variantCount + '、probe ' + run.done + '/' + run.probeCount + ' 完成，' + score + (run.missing.length ? '，待补跑 ' + run.missing.join('、') : '')
+        const extras = [
+          '重复 ' + run.repeats + ' 次',
+          '模式 ' + run.mode,
+          run.budget ? '预算 ' + run.budget : '',
+          run.parent ? '父代 ' + run.parent : '',
+          run.archived ? '已归档' : '',
+        ].filter(Boolean).join('、')
+        return '- ' + run.runId + '：变体 ' + run.variantCount + '、probe ' + run.done + '/' + run.probeCount + ' 完成（' + extras + '），' + score + (run.missing.length ? '，待补跑 ' + run.missing.join('、') : '')
       })
       const note = [
         '实验状态（' + ids.length + ' 个）：',
         ...lines,
-        detail ? '\n下一步：' + (pending.length ? '补跑 ' + pending.length + ' 个 probe（指令见下）' : detail.hasReport ? '已有评分报告，可用 rsi-adopt（带 proposalId）采纳改动' : '全部 probe 已产出，执行 rsi-collect 汇总评分') : '\n指定 runId 可查看单个实验的 probe 明细与补跑指令。',
+        detail
+          ? '\n下一步：' + (pending.length
+            ? '补跑 ' + pending.length + ' 个 probe（指令见下）'
+            : detail.hasReport
+              ? '已有评分报告，可用 rsi-compare 做对比式探测，或用 rsi-adopt（带 proposalId）采纳改动'
+              : '全部 probe 已产出，执行 rsi-collect 汇总评分')
+          : '\n指定 runId 可查看单个实验的 probe 明细与补跑指令。',
       ].join('\n')
-      return {
-        dir: root,
-        runId: detail ? runs[0].runId : wanted,
-        runs,
-        probes: detail ? detail.probes : [],
-        instructions,
-        note,
+      return { dir: root, runId: detail ? runs[0].runId : wanted, runs, probes: detail ? detail.probes : [], instructions, note }
+    },
+  }
+}
+
+function resolveVariantDir(runDir, wanted) {
+  const names = listDirNames(path.join(runDir, 'variants'))
+  const key = slug(wanted)
+  const found = names.find((name) => name === wanted)
+    ?? names.find((name) => slug(name.replace(/^\d+-/, '')) === key)
+  if (!found) throw new Error(`变体不存在：${wanted}（可选：${names.join('、')}）`)
+  return found
+}
+
+function variantProbeDir(runDir, variantDir, repeat, repeats) {
+  const base = path.join(runDir, 'probes', variantDir)
+  if (repeats > 1) return path.join(base, 'r' + repeat)
+  const nested = listDirNames(base).filter((name) => /^r\d+$/.test(name))
+  return nested.length ? path.join(base, 'r' + repeat) : base
+}
+
+function compareTool() {
+  return {
+    name: 'rsi-compare',
+    description: '对比式探测（B2）：把两个变体同一任务的产出做逐文件差异对比，写出 compare.md/json，并可回写裁判结论（winner=a|b|tie）。不需要预先定义 ground truth，用于「哪个 harness 行为更好」的成对比较。',
+    parameters: {
+      cwd: { type: 'string', required: true, description: '工作区绝对路径' },
+      runId: { type: 'string', required: true, description: '实验 id' },
+      a: { type: 'string', required: true, description: '变体 A（label 或目录名）' },
+      b: { type: 'string', required: true, description: '变体 B（label 或目录名）' },
+      repeat: { type: 'number', description: '第几次重复对比（默认 1）' },
+      judge: {
+        type: 'object',
+        description: '裁判结论（可选）：由裁判子代理给出后回写',
+        properties: {
+          winner: { type: 'string', enum: ['a', 'b', 'tie'], description: '胜者' },
+          reason: { type: 'string', description: '理由' },
+          confidence: { type: 'number', description: '置信度 0~1' },
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          runId: { type: 'string' },
+          a: { type: 'string' },
+          b: { type: 'string' },
+          repeat: { type: 'number' },
+          summary: { type: 'object' },
+          comparePath: { type: 'string' },
+          judge: { type: 'object' },
+          instructions: { type: 'string' },
+          note: { type: 'string' },
+        },
+      },
+      render: (args, value) => [textBlock(value.note + (value.instructions ? '\n\n' + value.instructions : ''))],
+    },
+    timeoutMs: 60000,
+    async execute(args) {
+      const cwd = path.resolve(String(args.cwd ?? ''))
+      const runId = slug(String(args.runId ?? ''))
+      if (!pathExists(path.join(runRoot(cwd), runId))) throw new Error('实验不存在：' + runId)
+      const runDir = path.join(runRoot(cwd), runId)
+      const config = readRunConfig(cwd, runId)
+      const repeats = plannedRepeats(config)
+      const repeat = Math.max(1, Math.min(repeats, Math.floor(Number(args.repeat ?? 1)) || 1))
+      const dirA = resolveVariantDir(runDir, String(args.a ?? ''))
+      const dirB = resolveVariantDir(runDir, String(args.b ?? ''))
+      if (dirA === dirB) throw new Error('a 与 b 不能是同一个变体')
+      const probeA = variantProbeDir(runDir, dirA, repeat, repeats)
+      const probeB = variantProbeDir(runDir, dirB, repeat, repeats)
+      const result = compareDirs(probeA, probeB)
+      const labelA = dirA.replace(/^\d+-/, '')
+      const labelB = dirB.replace(/^\d+-/, '')
+      const title = `对比式探测：${labelA} vs ${labelB}（第 ${repeat} 次）`
+      const rel = path.join('.rsi', 'runs', runId, 'compare', `${slug(labelA)}__vs__${slug(labelB)}`, 'r' + repeat)
+      writeFileSafe(cwd, path.join(rel, 'compare.md'), renderCompareMarkdown(title, probeA, probeB, result) + '\n')
+      let judge = null
+      if (args.judge && typeof args.judge === 'object') {
+        const winner = String(args.judge.winner ?? '').toLowerCase()
+        if (!['a', 'b', 'tie'].includes(winner)) throw new Error(`judge.winner 必须是 a|b|tie，收到：${args.judge.winner}`)
+        const confidence = Number(args.judge.confidence)
+        judge = {
+          winner,
+          reason: String(args.judge.reason ?? ''),
+          confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : null,
+          recordedAt: isoNow(),
+        }
       }
+      const payload = { runId, a: labelA, b: labelB, repeat, summary: result.summary, files: result.files, judge }
+      writeFileSafe(cwd, path.join(rel, 'compare.json'), JSON.stringify(payload, null, 2) + '\n')
+      const instructions = judge
+        ? ''
+        : [
+          '## 下一步：启动裁判子代理（全新 subagent）',
+          '',
+          '1. 发给它任务文本（runId ' + runId + ' 的 task.md）与两个变体的 harness；',
+          '2. 让它分别读 ' + probeA + ' 与 ' + probeB + ' 的产出；',
+          '3. 要求只返回 JSON：{"winner":"a|b|tie","reason":"...","confidence":0.0~1.0}；',
+          '4. 把该 JSON 作为 judge 参数再次调用 rsi-compare 回写结论。',
+        ].join('\n')
+      const diffText = `仅 A ${result.summary.onlyA}、仅 B ${result.summary.onlyB}、改动 ${result.summary.changed}、相同 ${result.summary.same}`
+      return {
+        runId,
+        a: labelA,
+        b: labelB,
+        repeat,
+        summary: result.summary,
+        comparePath: path.join(cwd, rel, 'compare.md'),
+        judge,
+        instructions,
+        note: '对比完成（' + diffText + '）' + (judge ? '；裁判结论：' + judge.winner + '（已回写）' : '；等待裁判子代理结论') + '\n报告：' + path.join(cwd, rel, 'compare.md'),
+      }
+    },
+  }
+}
+
+function archiveTool() {
+  return {
+    name: 'rsi-archive',
+    description: '归档 RSI 实验（B6）：把 .rsi/runs/<runId> 移到 .rsi/runs/_archive/<时间戳>-<runId> 并在索引里标记；也支持恢复与列出归档。',
+    parameters: {
+      cwd: { type: 'string', required: true, description: '工作区绝对路径' },
+      action: { type: 'string', required: true, enum: ['archive', 'restore', 'list'], description: '操作' },
+      runId: { type: 'string', description: '实验 id（archive/restore 必填）' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          action: { type: 'string' },
+          runId: { type: 'string' },
+          path: { type: 'string' },
+          runs: { type: 'array', items: { type: 'object' } },
+          note: { type: 'string' },
+        },
+      },
+      render: (args, value) => [textBlock(value.note)],
+    },
+    timeoutMs: 30000,
+    async execute(args) {
+      const cwd = path.resolve(String(args.cwd ?? ''))
+      if (!pathExists(cwd)) throw new Error('工作区不存在：' + cwd)
+      const action = String(args.action ?? 'list')
+      const rawRun = slug(String(args.runId ?? ''))
+      if (action === 'list') {
+        const index = readRunIndex(cwd)
+        const runs = index.runs.map((item) => ({
+          runId: String(item.runId ?? ''),
+          parent: String(item.parent ?? ''),
+          archived: item.archived === true,
+          archivePath: String(item.archivePath ?? ''),
+          planTs: String(item.planTs ?? ''),
+        }))
+        const archived = runs.filter((item) => item.archived).length
+        return { action, runId: '', path: '', runs, note: `索引中共 ${runs.length} 个实验，已归档 ${archived} 个。` }
+      }
+      if (!rawRun) throw new Error('archive/restore 需要 runId')
+      if (action === 'archive') {
+        const result = archiveRun(cwd, rawRun)
+        return { action, runId: rawRun, path: result.to, runs: [], note: `实验 ${rawRun} 已归档到 ${result.rel}（仍在 .rsi 内，可 restore）。` }
+      }
+      if (action === 'restore') {
+        const result = restoreRun(cwd, rawRun)
+        return { action, runId: rawRun, path: result.to, runs: [], note: `实验 ${rawRun} 已恢复到 ${result.to}。` }
+      }
+      throw new Error('未知 action：' + action + '（支持 archive/restore/list）')
+    },
+  }
+}
+
+function auditTool() {
+  return {
+    name: 'rsi-audit',
+    description: 'probe 写隔离审计（C2）：按实验创建时间扫描工作区内（排除 .rsi/.git/node_modules）被修改的文件，列出可能的 probe 越界写入。只读启发式检查，不自动改文件。',
+    parameters: {
+      cwd: { type: 'string', required: true, description: '工作区绝对路径' },
+      runId: { type: 'string', description: '实验 id（用它创建时间作为起点）' },
+      since: { type: 'string', description: 'ISO 时间起点（省略则取 runId 的创建时间）' },
+      limit: { type: 'number', description: '最多返回多少条命中（默认 200）' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          since: { type: 'string' },
+          scanned: { type: 'number' },
+          truncated: { type: 'boolean' },
+          hits: { type: 'array', items: { type: 'object' } },
+          note: { type: 'string' },
+        },
+      },
+      render: (args, value) => [textBlock(value.note)],
+    },
+    timeoutMs: 60000,
+    async execute(args) {
+      const cwd = path.resolve(String(args.cwd ?? ''))
+      if (!pathExists(cwd)) throw new Error('工作区不存在：' + cwd)
+      const runId = slug(String(args.runId ?? ''))
+      let since = String(args.since ?? '').trim()
+      if (!since && runId) since = String(readRunConfig(cwd, runId).createdAt ?? '')
+      if (!since) throw new Error('需要 runId 或 since（ISO 时间）作为审计起点')
+      const limit = Math.max(1, Math.min(1000, Math.floor(Number(args.limit ?? 200)) || 200))
+      const result = scanWrites(cwd, since)
+      const hits = result.hits.slice(0, limit)
+      const note = hits.length
+        ? `自 ${result.since} 起发现 ${result.hits.length} 个 .rsi 之外的写入（扫描 ${result.scanned} 个文件${result.truncated ? '，已截断' : ''}）：请逐条确认是否 probe 越界。`
+        : `自 ${result.since} 起未发现 .rsi 之外的写入（扫描 ${result.scanned} 个文件）。`
+      return { since: result.since, scanned: result.scanned, truncated: result.truncated, hits, note }
     },
   }
 }
@@ -1645,6 +1796,9 @@ export function apply(ctx) {
   register(reviewTool)
   register(runTool)
   register(lessonTool)
+  register(compareTool)
+  register(archiveTool)
+  register(auditTool)
 
   ctx.on('tools/result', (exec, result) => {
     if (!result || result.isError !== true) return
