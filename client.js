@@ -22,9 +22,10 @@ window.__ModuleLoader__.load({
           React.createElement('li', null, 'rsi-run — 查看实验/变体/probe 产出与补跑指令'),
           React.createElement('li', null, 'rsi-propose — 基于证据起草 harness 改进提案'),
           React.createElement('li', null, 'rsi-review — 列出提案并 approve/reject（提案库 .rsi/proposals/index.json）'),
-          React.createElement('li', null, 'rsi-adopt — 经你确认后采纳改动（自动备份 + 记录教训 + 标记 applied）'),
+          React.createElement('li', null, 'rsi-adopt — 仅采纳已 approve 的提案（自动备份 + 记录教训 + 标记 applied，失败回滚）'),
           React.createElement('li', null, 'rsi-lesson — 追加/查看教训库 harness-lessons.md'),
         ),
+        React.createElement('div', null, '评分表在 rsi-plan 时记录 sha256，rsi-collect 比对后才计分；任一机器项失败即判该变体未通过。'),
         React.createElement('div', { style: { marginTop: '6px', opacity: 0.75 } }, 'English: runs, failure evidence and reflection/digest cards are tracked under <cwd>/.rsi; review and adoption happen in conversation via rsi-run / rsi-evidence / rsi-propose / rsi-review / rsi-adopt / rsi-lesson.'),
       )
     }

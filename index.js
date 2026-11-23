@@ -1,3 +1,4 @@
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -46,6 +47,47 @@ function writeFileSafe(base, rel, content) {
   fs.mkdirSync(path.dirname(abs), { recursive: true })
   fs.writeFileSync(abs, content, 'utf8')
   return abs
+}
+
+/** 原子写：先写同目录临时文件再 rename，避免半截 JSON。 */
+function writeFileAtomic(base, rel, content) {
+  const abs = resolveInside(base, rel)
+  fs.mkdirSync(path.dirname(abs), { recursive: true })
+  const tmp = abs + '.' + process.pid + '.' + Date.now() + '.tmp'
+  fs.writeFileSync(tmp, content, 'utf8')
+  try {
+    fs.renameSync(tmp, abs)
+  } catch (error) {
+    try {
+      fs.unlinkSync(tmp)
+    } catch {
+      // 临时文件清理失败不覆盖原始错误
+    }
+    throw error
+  }
+  return abs
+}
+
+function sha256(text) {
+  return crypto.createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex')
+}
+
+/** 已存在路径取 realpath；不存在时向上找到最近的已存在祖先再拼接。 */
+function realPathOf(target) {
+  let current = path.resolve(target)
+  const tail = []
+  for (let i = 0; i < 64; i += 1) {
+    try {
+      const real = fs.realpathSync.native(current)
+      return tail.length ? path.join(real, ...tail.reverse()) : real
+    } catch {
+      const parent = path.dirname(current)
+      if (parent === current) return path.resolve(target)
+      tail.push(path.basename(current))
+      current = parent
+    }
+  }
+  return path.resolve(target)
 }
 
 function readJson(p) {
@@ -132,14 +174,51 @@ function compileParameters(spec) {
   return { type: 'object', properties, ...(required.length ? { required } : {}) }
 }
 
-function isAllowedAdoptPath(rel) {
-  const r = String(rel ?? '').replace(/\\/g, '/')
-  return r === 'AGENTS.md'
-    || (r.startsWith('.agents/') && r.endsWith('/SKILL.md'))
-    || r.startsWith('.rsi/')
+const ADOPT_RSI_DENY = ['bundles/', 'evidence/', 'state/', 'proposals/', 'backups/']
+
+function normalizeRel(rel) {
+  return String(rel ?? '').replace(/\\/g, '/').replace(/^\.\//, '')
 }
 
+function hasDotDotSegment(rel) {
+  return normalizeRel(rel).split('/').some((seg) => seg === '..' || seg === '.')
+}
+
+/** 白名单 + 归一化 + realpath 三重校验；任何越界一律抛错（fail-closed）。 */
+function resolveAllowedAdoptPath(cwd, rel) {
+  const r = normalizeRel(rel)
+  if (!r) throw new Error('采纳路径为空')
+  if (path.isAbsolute(r) || /^[a-zA-Z]:/.test(r)) throw new Error(`采纳路径必须是相对路径：'${rel}'`)
+  if (hasDotDotSegment(r)) throw new Error(`采纳路径不得包含 '.' 或 '..' 段：'${rel}'`)
+  const allowed = r === 'AGENTS.md'
+    || (r.startsWith('.agents/') && r.endsWith('/SKILL.md'))
+    || (r.startsWith('.rsi/') && !ADOPT_RSI_DENY.some((deny) => r.startsWith('.rsi/' + deny)))
+  if (!allowed) {
+    throw new Error(`采纳路径不在白名单内：'${rel}'（仅允许 AGENTS.md、.agents/**/SKILL.md，以及 .rsi/ 下非 bundles|evidence|state|proposals|backups 的路径）`)
+  }
+  const abs = path.resolve(cwd, r)
+  const realBase = realPathOf(cwd)
+  const realTarget = realPathOf(abs)
+  const inside = realTarget === realBase || realTarget.startsWith(realBase + path.sep)
+  if (!inside) throw new Error(`采纳路径经符号链接逃逸出工作区：'${rel}' → '${realTarget}'`)
+  return abs
+}
+
+function isAllowedAdoptPath(cwd, rel) {
+  try {
+    resolveAllowedAdoptPath(cwd, rel)
+    return true
+  } catch {
+    return false
+  }
+}
+
+const EVAL_KINDS = ['file-exists', 'line-count', 'regex-all-lines', 'regex-last-line', 'contains', 'manual']
+
 function evaluateItem(item, probeDir) {
+  if (!item || typeof item !== 'object') {
+    return { id: '', label: '', kind: 'manual', weight: 0, ok: false, detail: '评分项为空或非法，判失败' }
+  }
   const weight = typeof item.weight === 'number' && item.weight >= 0 ? item.weight : 1
   const base = {
     id: item.id ?? '',
@@ -149,15 +228,29 @@ function evaluateItem(item, probeDir) {
     ok: null,
     detail: `人工评审项${item.note ? `：${item.note}` : ''}`,
   }
-  if (!item || !item.kind || item.kind === 'manual') return base
+  if (item.kind === 'manual' || !item.kind) return base
+  if (!EVAL_KINDS.includes(item.kind)) {
+    return { ...base, ok: false, detail: `未知 kind '${item.kind}'，判失败（合法值：${EVAL_KINDS.join(' | ')}）` }
+  }
   const target = item.path ? resolveInside(probeDir, item.path) : null
   const missing = { ...base, ok: false, detail: `文件缺失：${item.path ?? '(无 path)'}` }
   if (item.kind === 'file-exists') {
-    const ok = !!target && pathExists(target)
-    return { ...base, ok, detail: ok ? `文件存在：${item.path}` : `文件缺失：${item.path}` }
+    if (!target || !pathExists(target)) return { ...base, ok: false, detail: `文件缺失：${item.path}` }
+    let size = 0
+    try {
+      size = fs.statSync(target).size
+    } catch {
+      size = 0
+    }
+    if (size === 0) return { ...base, ok: false, detail: `文件为空（0 字节）：${item.path}` }
+    if ((readFileOrNull(target) ?? '').trim() === '') return { ...base, ok: false, detail: `文件只有空白字符：${item.path}` }
+    return { ...base, ok: true, detail: `文件存在（${size} 字节）：${item.path}` }
   }
   if (!target || !pathExists(target)) return missing
   const content = readFileOrNull(target) ?? ''
+  if (content.trim() === '') {
+    return { ...base, ok: false, detail: `文件为空（0 非空字符）：${item.path}` }
+  }
   if (item.kind === 'line-count') {
     const n = splitLines(content).length
     const ok = (item.min == null || n >= item.min) && (item.max == null || n <= item.max)
@@ -183,7 +276,25 @@ function evaluateItem(item, probeDir) {
     const ok = content.includes(String(item.pattern ?? ''))
     return { ...base, ok, detail: ok ? `找到片段：${item.pattern}` : `未找到片段：${item.pattern}` }
   }
-  return { ...base, detail: `未知 kind '${item.kind}'，按人工评审处理` }
+  return { ...base, ok: false, detail: `未知 kind '${item.kind}'，判失败` }
+}
+
+function validateRubric(rubric) {
+  if (!rubric || typeof rubric !== 'object' || !Array.isArray(rubric.items) || !rubric.items.length) {
+    throw new Error('rubric 必须包含至少一个评分项（items[] 非空）')
+  }
+  if (rubric.passScore != null) {
+    if (!Number.isFinite(rubric.passScore) || rubric.passScore <= 0) {
+      throw new Error(`rubric.passScore 必须是大于 0 的有限数字，收到：${JSON.stringify(rubric.passScore)}`)
+    }
+  }
+  rubric.items.forEach((item, index) => {
+    if (!item || typeof item !== 'object') throw new Error(`评分项 #${index + 1} 非法`)
+    if (item.kind != null && !EVAL_KINDS.includes(item.kind)) {
+      throw new Error(`评分项 #${index + 1} 的 kind '${item.kind}' 未知（合法值：${EVAL_KINDS.join(' | ')}）`)
+    }
+  })
+  return rubric
 }
 
 function planTool() {
@@ -263,8 +374,17 @@ function planTool() {
       const rubric = args.rubric && typeof args.rubric === 'object' && Array.isArray(args.rubric.items)
         ? args.rubric
         : { passScore: null, items: [{ id: 'overall', label: '总体完成度', kind: 'manual', weight: 1, note: '人工评审' }] }
-      writeFileSafe(cwd, path.join('.rsi', 'runs', runId, 'rubric.json'), JSON.stringify(rubric, null, 2) + '\n')
-      writeFileSafe(cwd, path.join('.rsi', 'runs', runId, 'config.json'), JSON.stringify({ cwd, runId, createdAt: new Date().toISOString(), variantCount: variants.length }, null, 2) + '\n')
+      validateRubric(rubric)
+      const rubricText = JSON.stringify(rubric, null, 2) + '\n'
+      writeFileSafe(cwd, path.join('.rsi', 'runs', runId, 'rubric.json'), rubricText)
+      writeFileSafe(cwd, path.join('.rsi', 'runs', runId, 'config.json'), JSON.stringify({
+        cwd,
+        runId,
+        createdAt: new Date().toISOString(),
+        variantCount: variants.length,
+        rubricSha256: sha256(rubricText),
+        rubricRuleVersion: 2,
+      }, null, 2) + '\n')
 
       const labels = []
       const blocks = [`# RSI 实验 ${runId}\n\n运行目录：${runDir}\n`]
@@ -296,7 +416,7 @@ function collectTool() {
     parameters: {
       cwd: { type: 'string', required: true, description: '工作区绝对路径' },
       runId: { type: 'string', required: true, description: '实验 id' },
-      rubric: { type: 'object', description: '可选覆盖评分表；缺省读取 runs/<runId>/rubric.json' },
+      // 评分表只能来自 runs/<runId>/rubric.json（并校验创建时的 sha256），不接受调用方覆盖
     },
     output: {
       schema: {
@@ -312,9 +432,11 @@ function collectTool() {
           passScore: { type: 'number' },
           hasPassScore: { type: 'boolean' },
           passed: { type: 'boolean' },
+          rubricHashVerified: { type: 'boolean' },
+          failedVariants: { type: 'array', items: { type: 'string' } },
         },
       },
-      render: (args, value) => [textBlock(`汇总完成：${value.hasPassScore ? (value.passed ? '有变体通过' : '无变体通过') : '待人工评审'}（总分 ${value.total}/${value.maxTotal}）\n报告：${value.reportPath}`)],
+      render: (args, value) => [textBlock(`汇总完成：${value.hasPassScore ? (value.passed ? '全部变体通过' : `未全部通过（${value.failedVariants.join('、') || '无有效变体'}）`) : '待人工评审'}（总分 ${value.total}/${value.maxTotal}，评分表哈希${value.rubricHashVerified ? '已校验' : '未校验（旧实验）'}）\n报告：${value.reportPath}`)],
     },
     timeoutMs: 60000,
     async execute(args) {
@@ -323,46 +445,93 @@ function collectTool() {
       if (!runId) throw new Error('runId 不能为空')
       const runDir = resolveInside(cwd, path.join('.rsi', 'runs', runId))
       if (!pathExists(runDir)) throw new Error(`实验不存在：${runDir}`)
-      const rubric = args.rubric && Array.isArray(args.rubric.items) ? args.rubric : readJson(path.join(runDir, 'rubric.json'))
-      if (!rubric || !Array.isArray(rubric.items)) throw new Error('rubric 缺失或格式错误')
-      const probeDirs = listDirNames(path.join(runDir, 'probes')).sort()
-      if (!probeDirs.length) throw new Error('没有任何 probe 目录')
+      const rubricPath = path.join(runDir, 'rubric.json')
+      const rubricText = readFileOrNull(rubricPath)
+      if (rubricText == null) throw new Error('rubric.json 缺失，拒绝汇总')
+      let rubric
+      try {
+        rubric = JSON.parse(rubricText)
+      } catch (error) {
+        throw new Error(`rubric.json 解析失败：${error instanceof Error ? error.message : String(error)}`)
+      }
+      validateRubric(rubric)
+      const configPath = path.join(runDir, 'config.json')
+      let config = {}
+      if (pathExists(configPath)) {
+        try {
+          config = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+        } catch {
+          throw new Error(`config.json 解析失败：${configPath}`)
+        }
+      }
+      const rubricSha256 = sha256(rubricText)
+      let rubricHashVerified = false
+      if (typeof config?.rubricSha256 === 'string' && config.rubricSha256) {
+        if (config.rubricSha256 !== rubricSha256) {
+          throw new Error(`rubric.json 与创建实验时的哈希不一致（记录 ${config.rubricSha256.slice(0, 12)}…，当前 ${rubricSha256.slice(0, 12)}…），评分表被改动，拒绝汇总`)
+        }
+        rubricHashVerified = true
+      }
+      const variantDirs = listDirNames(path.join(runDir, 'variants')).sort()
+      if (!variantDirs.length) throw new Error('没有任何 variants 目录')
+      const probeNames = new Set(listDirNames(path.join(runDir, 'probes')))
+      const hasPassScore = Number.isFinite(rubric.passScore) && rubric.passScore > 0
+      const passScore = hasPassScore ? rubric.passScore : 0
       const variants = []
       const manualItems = []
-      for (const dirName of probeDirs) {
+      for (const dirName of variantDirs) {
         const probeDir = path.join(runDir, 'probes', dirName)
         const label = dirName.replace(/^\d+-/, '')
+        const probeExists = probeNames.has(dirName) && pathExists(probeDir)
+        const rows = rubric.items.map((item) => {
+          const safeItem = item && typeof item === 'object' ? item : {}
+          if (probeExists) return evaluateItem(safeItem, probeDir)
+          const manual = safeItem.kind == null || safeItem.kind === 'manual'
+          return {
+            id: safeItem.id ?? '',
+            label: safeItem.label ?? safeItem.id ?? '',
+            kind: safeItem.kind ?? 'manual',
+            weight: typeof safeItem.weight === 'number' && safeItem.weight >= 0 ? safeItem.weight : 1,
+            ok: manual ? null : false,
+            detail: 'probe 目录缺失，判 0 分',
+          }
+        })
         let score = 0
         let max = 0
-        const rows = rubric.items.map((item) => {
-          const row = evaluateItem(item, probeDir)
+        let failed = 0
+        for (const row of rows) {
+          if (row.kind == null || row.kind === 'manual') {
+            if (row.ok === null) manualItems.push(`[${label}] ${row.label || row.id || ''}`)
+            continue
+          }
           max += row.weight
           if (row.ok === true) score += row.weight
-          if (row.ok === null) manualItems.push(`[${label}] ${row.label || row.id || ''}`)
-          return row
-        })
-        const passed = rubric.passScore != null ? score >= rubric.passScore : null
-        variants.push({ label, dir: dirName, score, max, passed, rows })
+          else failed += 1
+        }
+        // 任一机器评分项失败即判该变体未通过：passScore 只是分数门槛，不能掩盖漏交付
+        const variantPassed = hasPassScore ? score >= passScore && failed === 0 : null
+        variants.push({ label, dir: dirName, probeExists, score, max, failed, passed: variantPassed, rows })
       }
-      const hasPassScore = typeof rubric.passScore === 'number'
-      const passScore = hasPassScore ? rubric.passScore : 0
       const total = variants.reduce((acc, v) => acc + v.score, 0)
       const maxTotal = variants.reduce((acc, v) => acc + v.max, 0)
-      const passed = hasPassScore && variants.some((v) => v.passed)
-      const lines = ['# RSI 实验汇总', '', `runId: ${runId}`, '']
+      const failedVariants = variants.filter((v) => v.passed !== true).map((v) => v.label)
+      const strictRule = '任一机器评分项失败即判该变体未通过（passScore 只作分数门槛）'
+      const passed = hasPassScore && variants.length > 0 && variants.every((v) => v.passed === true)
+      const lines = ['# RSI 实验汇总', '', `runId: ${runId}`, `评分表哈希：${rubricHashVerified ? '已校验 ' : '未校验（旧实验无记录） '}${rubricSha256}`, `判定规则：${strictRule}`, '']
       for (const v of variants) {
-        lines.push(`## ${v.label} — ${v.score}/${v.max}${v.passed === true ? ' ✅ 通过' : v.passed === false ? ' ❌ 未通过' : ''}`, '')
+        lines.push(`## ${v.label} — ${v.score}/${v.max}${v.passed === true ? ' ✅ 通过' : v.passed === false ? ' ❌ 未通过' : ''}${v.probeExists ? '' : '（probe 目录缺失）'}`, '')
         lines.push('| 评分项 | 结果 | 说明 |', '| --- | --- | --- |')
         for (const row of v.rows) {
-          lines.push(`| ${row.label || row.id || '-'} | ${row.ok === true ? '✅' : row.ok === false ? '❌' : '👤 人工'} | ${row.detail ?? ''} |`)
+          lines.push(`| ${row.label || row.id || '-'} | ${row.ok === true ? '✅' : row.ok === false ? '❌' : '👤 人工'} | ${String(row.detail ?? '').replace(/\|/g, '\\|')} |`)
         }
         lines.push('')
       }
+      if (failedVariants.length) lines.push('## 未通过变体', '', ...failedVariants.map((name) => `- ${name}`), '')
       if (manualItems.length) lines.push('## 待人工评审', '', ...manualItems.map((m) => `- ${m}`), '')
       const reportPath = path.join(runDir, 'report.md')
       fs.writeFileSync(reportPath, lines.join('\n'), 'utf8')
-      fs.writeFileSync(path.join(runDir, 'report.json'), JSON.stringify({ runId, passScore, hasPassScore, total, maxTotal, passed, variants, manualItems }, null, 2) + '\n', 'utf8')
-      return { runId, variants, manualItems, reportPath, maxTotal, total, passScore, hasPassScore, passed }
+      fs.writeFileSync(path.join(runDir, 'report.json'), JSON.stringify({ runId, passScore, hasPassScore, total, maxTotal, passed, rubricSha256, rubricHashVerified, failedVariants, variants, manualItems }, null, 2) + '\n', 'utf8')
+      return { runId, variants, manualItems, reportPath, maxTotal, total, passScore, hasPassScore, passed, rubricHashVerified, failedVariants }
     },
   }
 }
@@ -413,42 +582,74 @@ function adoptTool() {
       if (!pathExists(cwd)) throw new Error(`工作区不存在：${cwd}`)
       const evidence = String(args.evidence ?? '').trim()
       if (!evidence) throw new Error('RSI 红线：没有证据的 harness 修改被拒绝')
+      const proposal = requireApprovedProposal(cwd, args.proposalId)
       const ts = stamp()
-      const tag = String(args.label ?? '').trim() || String(args.runId ?? '').trim() || '手工提案'
+      const tag = String(args.label ?? '').trim() || String(proposal.title ?? '').trim() || String(args.runId ?? '').trim() || proposal.id
       const lessonsRel = path.join('.rsi', 'memory', 'harness-lessons.md')
+      const lessonsAbs = path.join(cwd, lessonsRel)
+      const lessonsBefore = readFileOrNull(lessonsAbs)
       const appendLesson = (mode, changed) => {
-        const existing = readFileOrNull(path.join(cwd, lessonsRel)) ?? ''
+        const existing = lessonsBefore ?? ''
         const prefix = existing && !existing.endsWith('\n') ? '\n' : ''
         const block = `## ${ts} — ${tag}（已采纳，${mode}）\n\n- 证据：${evidence.replace(/\r?\n/g, ' ')}\n- 采纳改动：${changed.join('、') || '（无文件）'}\n`
         writeFileSafe(cwd, lessonsRel, existing + prefix + block + '\n')
+      }
+      const restoreLessons = () => {
+        try {
+          if (lessonsBefore == null) {
+            if (pathExists(lessonsAbs)) fs.unlinkSync(lessonsAbs)
+          } else {
+            writeFileSafe(cwd, lessonsRel, lessonsBefore)
+          }
+        } catch {
+          // 教训库回滚尽力而为
+        }
       }
       if (args.mode === 'workspace') {
         const files = Array.isArray(args.files) && args.files.length ? args.files : null
         if (!files) throw new Error('files 不能为空（workspace 模式）')
         const backupDir = path.join(cwd, '.rsi', 'backups', ts)
         const changed = []
+        const touched = []
         for (const file of files) {
-          const rel = String(file?.path ?? '').replace(/\\/g, '/').replace(/^\.\//, '')
-          if (!isAllowedAdoptPath(rel)) {
-            throw new Error(`路径不在允许范围内：${rel}（仅限 AGENTS.md、.agents/**/SKILL.md、.rsi/**）`)
-          }
-          const abs = resolveInside(cwd, rel)
-          if (pathExists(abs)) {
+          const rel = normalizeRel(file?.path)
+          const abs = resolveAllowedAdoptPath(cwd, rel)
+          const existed = pathExists(abs)
+          if (existed) {
             const backupAbs = path.join(backupDir, rel)
             fs.mkdirSync(path.dirname(backupAbs), { recursive: true })
             fs.copyFileSync(abs, backupAbs)
           }
           writeFileSafe(cwd, rel, String(file?.content ?? ''))
           changed.push(rel)
+          touched.push({ rel, existed })
         }
-        appendLesson('workspace', changed)
-        const appliedProposal = markProposalApplied(cwd, args.proposalId)
+        const rollback = () => {
+          for (const entry of touched) {
+            const abs = path.join(cwd, entry.rel)
+            const backupAbs = path.join(backupDir, entry.rel)
+            try {
+              if (entry.existed && pathExists(backupAbs)) fs.copyFileSync(backupAbs, abs)
+              else if (!entry.existed && pathExists(abs)) fs.unlinkSync(abs)
+            } catch {
+              // 回滚尽力而为；备份目录仍保留供人工恢复
+            }
+          }
+          restoreLessons()
+        }
+        try {
+          appendLesson('workspace', changed)
+          markProposalApplied(cwd, proposal.id)
+        } catch (error) {
+          rollback()
+          throw new Error(`采纳未能完成，已回滚文件改动（备份保留在 ${backupDir}）：${error instanceof Error ? error.message : String(error)}`)
+        }
         return {
           mode: 'workspace',
           changed,
           backupDir,
           bundleDir: '',
-          note: `已采纳 ${changed.length} 个文件改动；原文件备份在 ${backupDir}；决策已追加到 .rsi/memory/harness-lessons.md${appliedProposal ? `；提案 ${appliedProposal} 已标记 applied` : ''}`,
+          note: `已采纳 ${changed.length} 个文件改动；原文件备份在 ${backupDir}；决策已追加到 .rsi/memory/harness-lessons.md；提案 ${proposal.id} 已标记 applied`,
         }
       }
       const bundleName = slug(String(args.name ?? 'rsi-preset'))
@@ -458,6 +659,13 @@ function adoptTool() {
       const bundleDir = path.join(cwd, '.rsi', 'presets', bundleName)
       if (pathExists(bundleDir)) throw new Error(`preset bundle 目录已存在：${bundleDir}`)
       const packageName = `@local/${bundleName}`
+      const removeBundle = () => {
+        try {
+          fs.rmSync(bundleDir, { recursive: true, force: true })
+        } catch {
+          // bundle 目录清理尽力而为
+        }
+      }
       writeFileSafe(cwd, path.join('.rsi', 'presets', bundleName, 'package.json'), JSON.stringify({
         name: packageName,
         version: '1.0.0',
@@ -467,18 +675,25 @@ function adoptTool() {
       }, null, 2) + '\n')
       writeFileSafe(cwd, path.join('.rsi', 'presets', bundleName, 'cordis.patch.yml'), patch + '\n')
       writeFileSafe(cwd, path.join('.rsi', 'presets', bundleName, 'README.md'), `# ${bundleName}\n\n由 rsi-adopt 生成（${ts}，实验 ${args.runId ?? '-'}）。\n\n安装（需人工批准）：plugin_manager action=install_bundle，target=${bundleDir}\n`)
-      appendLesson('preset-bundle', [`.rsi/presets/${bundleName}/`])
-      const appliedBundleProposal = markProposalApplied(cwd, args.proposalId)
+      try {
+        appendLesson('preset-bundle', [`.rsi/presets/${bundleName}/`])
+        markProposalApplied(cwd, proposal.id)
+      } catch (error) {
+        removeBundle()
+        restoreLessons()
+        throw new Error(`采纳未能完成，已删除生成的 bundle：${error instanceof Error ? error.message : String(error)}`)
+      }
       return {
         mode: 'preset-bundle',
         changed: [`.rsi/presets/${bundleName}/`],
         backupDir: '',
         bundleDir,
-        note: `bundle 已写入 ${bundleDir}（包名 ${packageName}）。下一步（需你人工批准）：plugin_manager action=install_bundle，target=${bundleDir}。安装前请审阅 cordis.patch.yml。${appliedBundleProposal ? `提案 ${appliedBundleProposal} 已标记 applied。` : ''}`,
+        note: `bundle 已写入 ${bundleDir}（包名 ${packageName}）。下一步（需你人工批准）：plugin_manager action=install_bundle，target=${bundleDir}。安装前请审阅 cordis.patch.yml。提案 ${proposal.id} 已标记 applied。`,
       }
     },
   }
 }
+
 
 function statusTool() {
   return {
@@ -513,6 +728,7 @@ function statusTool() {
           lessonEntries: { type: 'number' },
           lastReflectionAt: { type: 'string' },
           lastDigestAt: { type: 'string' },
+          stateError: { type: 'string' },
         },
       },
       render: (args, value) => [textBlock(`runs: ${value.runs.length}、教训 ${value.lessonEntries} 条/${value.lessonLines} 行、备份 ${value.backupCount}、presets ${value.presets.length}、提案 draft ${value.proposals.draft}/approved ${value.proposals.approved}/applied ${value.proposals.applied}、反思卡 ${value.inbox}、巡检摘要 ${value.digests}`)],
@@ -532,10 +748,12 @@ function statusTool() {
       const inbox = listFiles(path.join(dir, 'inbox')).filter((name) => name.endsWith('.md')).length
       const digests = listFiles(path.join(dir, 'inbox')).filter((name) => /^digest-.+\.md$/.test(name)).length
       const lessonEntries = lessonBlocks(readFileOrNull(lessonsPath) ?? '').length
-      const state = readReflectState(cwd)
-      const lastReflectionAt = String(state.lastReflectAt || '')
+      const { state, error: stateError } = readReflectStateSafe(cwd)
+      const sessions = state.sessions && typeof state.sessions === 'object' ? Object.values(state.sessions) : []
+      const sessionTimes = sessions.map((entry) => String(entry?.lastReflectAt ?? '')).filter(Boolean).sort()
+      const lastReflectionAt = sessionTimes.length ? sessionTimes[sessionTimes.length - 1] : String(state.lastReflectAt || '')
       const lastDigestAt = String(state.lastDigestAt || '')
-      return { dir, runs, lessonsPath, lessonLines, backupCount, presets, proposals, inbox, digests, lessonEntries, lastReflectionAt, lastDigestAt }
+      return { dir, runs, lessonsPath, lessonLines, backupCount, presets, proposals, inbox, digests, lessonEntries, lastReflectionAt, lastDigestAt, stateError }
     },
   }
 }
@@ -561,8 +779,24 @@ function truncateEvidence(value) {
 
 function sessionIdOf(value) {
   if (!value) return null
-  if (typeof value === 'string') return value
-  return value.id ?? value.sessionId ?? value.session?.id ?? null
+  if (typeof value === 'string') return value.trim() || null
+  return value.id ?? value.sessionId ?? value.session?.id ?? value.agent?.session?.id ?? null
+}
+
+const EVIDENCE_ARG_KEYS = ['cwd', 'runId', 'action', 'proposalId', 'mode', 'path', 'query', 'url', 'command', 'pattern', 'label']
+
+/** 只保留白名单键，每值截断 200 字符，避免把整份文件写进证据。 */
+function pickArguments(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const keys = Object.keys(value)
+  const ordered = [...keys.filter((key) => EVIDENCE_ARG_KEYS.includes(key)), ...keys.filter((key) => !EVIDENCE_ARG_KEYS.includes(key))]
+  const out = {}
+  for (const key of ordered.slice(0, 8)) {
+    const raw = value[key]
+    const text = typeof raw === 'string' ? raw : safeJson(raw)
+    out[key] = text.length > 200 ? text.slice(0, 200) + '…' : text
+  }
+  return out
 }
 
 function evidenceCwd(ctx, sessionId) {
@@ -575,6 +809,20 @@ function evidenceCwd(ctx, sessionId) {
   }
 }
 
+/** 超过行数/字节上限时转存为 .1.jsonl，保留最近一半记录（A6）。 */
+function rotateEvidence(file) {
+  try {
+    const text = readFileOrNull(file) ?? ''
+    const lines = splitLines(text)
+    if (lines.length <= EVIDENCE_MAX_LINES && Buffer.byteLength(text, 'utf8') <= EVIDENCE_MAX_BYTES) return
+    fs.copyFileSync(file, file.replace(/\.jsonl$/, '.1.jsonl'))
+    const keep = lines.slice(-Math.floor(EVIDENCE_MAX_LINES / 2))
+    fs.writeFileSync(file, keep.join('\n') + '\n', 'utf8')
+  } catch {
+    // 轮转失败时保留原文件，不影响主流程
+  }
+}
+
 function appendEvidence(ctx, sessionId, record) {
   const cwd = evidenceCwd(ctx, sessionId)
   if (!cwd) return
@@ -583,11 +831,8 @@ function appendEvidence(ctx, sessionId, record) {
     fs.mkdirSync(dir, { recursive: true })
     const safe = String(sessionId).replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown'
     const file = path.join(dir, `${safe}.jsonl`)
-    let data = (readFileOrNull(file) ?? '').replace(/\n+$/, '')
-    data = `${data ? data + '\n' : ''}${JSON.stringify(record)}`
-    const lines = data.split('\n')
-    while (lines.length > EVIDENCE_MAX_LINES || Buffer.byteLength(lines.join('\n') + '\n', 'utf8') > EVIDENCE_MAX_BYTES) lines.shift()
-    fs.writeFileSync(file, lines.join('\n') + '\n', 'utf8')
+    fs.appendFileSync(file, JSON.stringify(Object.assign({ session: sessionId }, record)) + '\n', 'utf8')
+    rotateEvidence(file)
   } catch {
     // 证据收集失败不影响任务执行
   }
@@ -607,19 +852,38 @@ function proposalIndexPath(cwd) {
   return path.join(cwd, '.rsi', 'proposals', 'index.json')
 }
 
-function readProposalIndex(cwd) {
-  let raw = null
+/** 严格读：坏 JSON 直接抛错，绝不静默清空提案库。 */
+function readProposalIndexStrict(cwd) {
+  const file = proposalIndexPath(cwd)
+  if (!pathExists(file)) return { proposals: [] }
+  const text = fs.readFileSync(file, 'utf8')
+  let raw
   try {
-    raw = readJson(proposalIndexPath(cwd))
-  } catch {
-    raw = null
+    raw = JSON.parse(text)
+  } catch (error) {
+    throw new Error(`提案索引损坏（${file}）：${error instanceof Error ? error.message : String(error)}；原文件已保留，请人工修复或删除后重建`)
   }
-  const list = raw && Array.isArray(raw.proposals) ? raw.proposals : []
-  return { proposals: list }
+  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.proposals)) {
+    throw new Error(`提案索引结构非法（${file}）：缺少 proposals 数组`)
+  }
+  return raw
+}
+
+function readProposalIndex(cwd) {
+  return readProposalIndexStrict(cwd)
 }
 
 function writeProposalIndex(cwd, index) {
-  writeFileSafe(cwd, path.join('.rsi', 'proposals', 'index.json'), JSON.stringify(index, null, 2) + '\n')
+  const rel = path.join('.rsi', 'proposals', 'index.json')
+  const abs = path.join(cwd, rel)
+  if (pathExists(abs)) {
+    try {
+      fs.copyFileSync(abs, abs + '.bak')
+    } catch {
+      // .bak 只是兜底，失败不阻塞写入
+    }
+  }
+  writeFileAtomic(cwd, rel, JSON.stringify(index, null, 2) + '\n')
 }
 
 function upsertProposal(cwd, entry) {
@@ -631,36 +895,86 @@ function upsertProposal(cwd, entry) {
   return index
 }
 
+function findProposal(cwd, id) {
+  const key = String(id ?? '').trim()
+  if (!key) return null
+  const index = readProposalIndexStrict(cwd)
+  return index.proposals.find((item) => item && item.id === key) ?? null
+}
+
+function requireApprovedProposal(cwd, proposalId) {
+  const id = String(proposalId ?? '').trim()
+  if (!id) throw new Error('RSI 红线：rsi-adopt 必须提供 proposalId，且该提案必须已通过 rsi-review approve')
+  const proposal = findProposal(cwd, id)
+  if (!proposal) throw new Error(`提案不存在：${id}（先用 rsi-propose 创建）`)
+  if (proposal.status !== 'approved') {
+    throw new Error(`提案 ${id} 当前状态为 ${proposal.status ?? 'unknown'}，只有 approved 才能采纳（先执行 rsi-review action=approve）`)
+  }
+  return proposal
+}
+
+const PROPOSAL_TRANSITIONS = {
+  draft: ['approved', 'rejected'],
+  approved: ['applied', 'rejected'],
+  rejected: ['draft'],
+  applied: [],
+}
+
+function assertProposalTransition(from, to) {
+  const allowed = PROPOSAL_TRANSITIONS[from] ?? []
+  if (!allowed.includes(to)) {
+    throw new Error(`提案状态不允许从 ${from} 变为 ${to}（允许：${allowed.length ? allowed.join('、') : '无'}）`)
+  }
+}
+
 function annotateProposalFile(cwd, proposal, status, note) {
-  const rel = proposal.file || path.join('.rsi', 'proposals', proposal.id + '.md')
+  const fallback = path.join('.rsi', 'proposals', proposal.id + '.md')
+  const rel = normalizeRel(proposal.file || fallback)
+  if (rel.split('/').includes('..') || !rel.startsWith('.rsi/proposals/')) {
+    throw new Error(`提案文件路径非法：${rel}（必须位于 .rsi/proposals/ 下）`)
+  }
   const text = readFileOrNull(path.join(cwd, rel))
   if (text == null) return
-  const replaced = text.replace(/^- 状态：.*$/m, '- 状态：' + status + '（' + isoNow() + '）')
+  const replaced = /^- 状态：.*$/m.test(text)
+    ? text.replace(/^- 状态：.*$/m, '- 状态：' + status + '（' + isoNow() + '）')
+    : text + `\n- 状态：${status}（${isoNow()}）\n`
   writeFileSafe(cwd, rel, note ? replaced + '\n> 审核备注：' + note + '\n' : replaced)
 }
 
 function setProposalStatus(cwd, id, status, note) {
   if (!PROPOSAL_STATUSES.includes(status)) throw new Error('未知提案状态：' + status)
-  const index = readProposalIndex(cwd)
+  const index = readProposalIndexStrict(cwd)
   const target = index.proposals.find((item) => item && item.id === id)
   if (!target) throw new Error('提案不存在：' + id)
+  const from = target.status ?? 'draft'
+  assertProposalTransition(from, status)
+  const previous = { status: from, updatedAt: target.updatedAt, reviewNote: target.reviewNote }
   target.status = status
   target.updatedAt = isoNow()
   if (note) target.reviewNote = note
   writeProposalIndex(cwd, index)
-  annotateProposalFile(cwd, target, status, note)
+  try {
+    annotateProposalFile(cwd, target, status, note)
+  } catch (error) {
+    target.status = previous.status
+    target.updatedAt = previous.updatedAt
+    if (previous.reviewNote == null) delete target.reviewNote
+    else target.reviewNote = previous.reviewNote
+    try {
+      writeProposalIndex(cwd, index)
+    } catch {
+      // 回滚状态写入失败时保留原始异常
+    }
+    throw error
+  }
   return target
 }
 
 function markProposalApplied(cwd, proposalId) {
-  const id = String(proposalId || '').trim()
-  if (!id) return ''
-  try {
-    const target = setProposalStatus(cwd, id, 'applied', 'rsi-adopt 已执行')
-    return target.file || path.join('.rsi', 'proposals', id + '.md')
-  } catch {
-    return ''
-  }
+  const id = String(proposalId ?? '').trim()
+  if (!id) throw new Error('markProposalApplied 需要提案 id')
+  const target = setProposalStatus(cwd, id, 'applied', 'rsi-adopt 已执行')
+  return target.file || path.join('.rsi', 'proposals', id + '.md')
 }
 
 function evidenceRecords(cwd) {
@@ -688,16 +1002,42 @@ function reflectStatePath(cwd) {
   return path.join(cwd, '.rsi', 'state', 'reflection.json')
 }
 
+/** 状态文件损坏时转存 .corrupt-<stamp>.json 并抛错，不再静默当空对象。 */
 function readReflectState(cwd) {
+  const file = reflectStatePath(cwd)
+  if (!pathExists(file)) return {}
+  const text = fs.readFileSync(file, 'utf8')
+  let state
   try {
-    return readJson(reflectStatePath(cwd)) || {}
-  } catch {
-    return {}
+    state = JSON.parse(text)
+  } catch (error) {
+    const saved = file.replace(/\.json$/, '') + '.corrupt-' + stamp() + '.json'
+    try {
+      fs.renameSync(file, saved)
+    } catch {
+      // 转存失败时保留原文件
+    }
+    throw new Error(`反思状态文件损坏（${file}）：${error instanceof Error ? error.message : String(error)}；已转存为 ${saved}`)
+  }
+  return state && typeof state === 'object' && !Array.isArray(state) ? state : {}
+}
+
+function readReflectStateSafe(cwd) {
+  try {
+    return { state: readReflectState(cwd), error: '' }
+  } catch (error) {
+    return { state: {}, error: error instanceof Error ? error.message : String(error) }
   }
 }
 
+function sessionReflectState(state, sessionId) {
+  const sessions = state && typeof state.sessions === 'object' && state.sessions ? state.sessions : {}
+  const entry = sessions[String(sessionId)]
+  return entry && typeof entry === 'object' ? entry : {}
+}
+
 function writeReflectState(cwd, state) {
-  writeFileSafe(cwd, path.join('.rsi', 'state', 'reflection.json'), JSON.stringify(state, null, 2) + '\n')
+  writeFileAtomic(cwd, path.join('.rsi', 'state', 'reflection.json'), JSON.stringify(state, null, 2) + '\n')
 }
 
 function summarizeRecords(records) {
@@ -748,20 +1088,23 @@ function maybeReflect(ctx, sessionId) {
     const cwd = evidenceCwd(ctx, sessionId)
     if (!cwd) return
     maybeDigest(cwd)
-    const state = readReflectState(cwd)
-    const lastAt = typeof state.lastReflectAt === 'string' ? state.lastReflectAt : ''
+    const { state } = readReflectStateSafe(cwd)
+    const entry = sessionReflectState(state, sessionId)
+    const lastAt = typeof entry.lastReflectAt === 'string' ? entry.lastReflectAt : ''
     const lastMs = lastAt ? Date.parse(lastAt) : NaN
     if (Number.isFinite(lastMs) && Date.now() - lastMs < REFLECT_MIN_GAP_MS) return
-    const all = evidenceRecords(cwd)
-    const fresh = lastAt ? all.filter((rec) => String(rec.ts) > lastAt) : all
+    const mine = evidenceRecords(cwd).filter((rec) => String(rec.session ?? '') === String(sessionId))
+    const fresh = lastAt ? mine.filter((rec) => String(rec.ts) > lastAt) : mine
     if (fresh.length < REFLECT_THRESHOLD) return
-    const cardPath = renderReflectCard(cwd, fresh, state, sessionId)
-    writeReflectState(cwd, Object.assign({}, readReflectState(cwd), {
+    const cardPath = renderReflectCard(cwd, fresh, entry, sessionId)
+    const rel = path.relative(cwd, cardPath).replace(/\\/g, '/')
+    const sessions = Object.assign({}, state.sessions && typeof state.sessions === 'object' ? state.sessions : {})
+    sessions[String(sessionId)] = {
       lastReflectAt: isoNow(),
-      lastEvidenceCount: all.length,
-      lastCard: path.relative(cwd, cardPath).replace(/\\/g, '/'),
-      lastSession: String(sessionId),
-    }))
+      lastEvidenceCount: mine.length,
+      lastCard: rel,
+    }
+    writeReflectState(cwd, Object.assign({}, state, { sessions, lastReflectAt: isoNow(), lastSession: String(sessionId) }))
   } catch {
     // 反思触发失败不影响任务执行
   }
@@ -1219,21 +1562,17 @@ function lessonTool() {
   }
 }
 
-function pendingCards(cwd, sinceIso) {
+/** 未消化 = inbox 中不在 state.digestConsumed 里的反思卡（按文件名，不依赖 mtime）。 */
+function pendingCards(cwd, consumed) {
   const dir = path.join(cwd, '.rsi', 'inbox')
-  const since = sinceIso ? Date.parse(sinceIso) : NaN
+  const seen = new Set(Array.isArray(consumed) ? consumed : [])
   const out = []
   for (const name of listFiles(dir)) {
     if (!/^reflect-.+\.md$/.test(name)) continue
-    let mtime = 0
-    try {
-      mtime = fs.statSync(path.join(dir, name)).mtimeMs
-    } catch {
-      mtime = 0
-    }
-    if (!Number.isFinite(since) || mtime > since) out.push({ name, mtime })
+    if (seen.has(name)) continue
+    out.push({ name, mtime: 0 })
   }
-  out.sort((a, b) => a.mtime - b.mtime)
+  out.sort((x, y) => x.name.localeCompare(y.name))
   return out
 }
 
@@ -1275,19 +1614,22 @@ function renderDigestCard(cwd, cards) {
 
 function maybeDigest(cwd) {
   try {
-    const state = readReflectState(cwd)
-    const cards = pendingCards(cwd, typeof state.lastDigestAt === 'string' ? state.lastDigestAt : '')
+    const { state } = readReflectStateSafe(cwd)
+    const consumed = Array.isArray(state.digestConsumed) ? state.digestConsumed : []
+    const cards = pendingCards(cwd, consumed)
     if (cards.length < DIGEST_THRESHOLD) return
     const cardPath = renderDigestCard(cwd, cards)
     writeReflectState(cwd, Object.assign({}, state, {
       lastDigestAt: isoNow(),
       lastDigestCount: cards.length,
       lastDigestCard: path.relative(cwd, cardPath).replace(/\\/g, '/'),
+      digestConsumed: consumed.concat(cards.map((card) => card.name)),
     }))
   } catch {
     // 巡检摘要失败不影响任务执行
   }
 }
+
 export function apply(ctx) {
   // parameters 必须是编译后的 JSON Schema，否则非 PTC 模式下整批工具定义会被 provider 拒绝。
   const register = (makeTool) => {
@@ -1306,21 +1648,36 @@ export function apply(ctx) {
 
   ctx.on('tools/result', (exec, result) => {
     if (!result || result.isError !== true) return
-    appendEvidence(ctx, sessionIdOf(exec?.agent ?? exec), {
+    // 宿主 exec 的参数字段是 arguments（不是 args），且 agent 才带 session id
+    const sessionId = sessionIdOf(exec?.agent)
+    if (!sessionId) return
+    appendEvidence(ctx, sessionId, {
       ts: new Date().toISOString(),
       source: 'tool-error',
-      tool: exec?.definition?.name ?? exec?.name ?? exec?.tool ?? 'unknown',
+      tool: exec?.name ?? 'unknown',
       error: truncateEvidence(result.error?.message ?? ''),
-      args: truncateEvidence(safeJson(exec?.args)),
+      args: pickArguments(exec?.arguments),
+      argKeys: Object.keys(exec?.arguments ?? {}).slice(0, 8),
     })
   })
 
   ctx.on('feedback/committed', (inspection) => {
     if (!inspection) return
-    appendEvidence(ctx, sessionIdOf(inspection), {
+    const events = Array.isArray(inspection.events) ? inspection.events : []
+    const last = events[events.length - 1]
+    if (!last || last.type !== 'feedback/message-put' || !last.data) return
+    const item = last.data.item
+    // 只把明确差评当作改进证据，普通过赞/取消不算
+    if (!item || item.rating !== 'negative') return
+    const sessionId = sessionIdOf(last.data.sessionId ?? inspection.meta?.id ?? inspection)
+    if (!sessionId) return
+    appendEvidence(ctx, sessionId, {
       ts: new Date().toISOString(),
       source: 'feedback',
-      feedback: truncateEvidence(safeJson(inspection)),
+      rating: item.rating,
+      messageId: item.messageId ?? null,
+      category: item.category ?? null,
+      note: truncateEvidence(item.note ?? ''),
     })
   })
 
