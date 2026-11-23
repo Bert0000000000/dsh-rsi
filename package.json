@@ -1,0 +1,54 @@
+{
+  "name": "dsh-rsi",
+  "version": "1.2.0",
+  "type": "module",
+  "description": "Recursive self-improvement toolkit for DeepSeek Harness: plan probe runs, track run state, score outputs, collect failure evidence, review proposals, adopt harness changes (Harness²-style Propose-Probe-Compose) and keep a lessons log.",
+  "engines": {
+    "dsh": "^0.2.3-alpha.2"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "rsi",
+    "recursive-self-improvement",
+    "self-improvement",
+    "harness",
+    "agent",
+    "propose-probe-compose"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bert0000000000/dsh-rsi.git"
+  },
+  "homepage": "https://github.com/Bert0000000000/dsh-rsi#readme",
+  "bugs": {
+    "url": "https://github.com/Bert0000000000/dsh-rsi/issues"
+  }
+}
