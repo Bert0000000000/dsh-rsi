@@ -1,6 +1,6 @@
 {
   "name": "dsh-rsi",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "type": "module",
   "description": "Recursive self-improvement tools for DeepSeek Harness: plan repeated probe runs, compare variant behavior, score outputs with tamper-checked rubrics, audit writes, archive runs with lineage, and adopt approved harness changes behind smoke checks and rollback.",
   "engines": {

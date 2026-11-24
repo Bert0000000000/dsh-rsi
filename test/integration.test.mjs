@@ -23,10 +23,40 @@ function makeCtx(overrides = {}) {
   return { tools, handlers }
 }
 
+/** 按工具声明的 output.schema 校验输出：运行时执行器会做同样的事，
+ *  这里提前拦截「返回 null 但 schema 声明 object」这类自相矛盾。 */
+function assertOutput(schema, value, where) {
+  if (value === undefined) return
+  if (value === null) {
+    assert.ok(schema && schema.nullable === true, where + ' 不能为 null')
+    return
+  }
+  if (!schema || !schema.type) return
+  if (schema.type === 'object') {
+    assert.ok(typeof value === 'object' && !Array.isArray(value), where + ' 应为 object')
+    const props = schema.properties || {}
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(value)) assert.ok(key in props, where + '.' + key + ' 未在 output.schema 中声明')
+    }
+    for (const [key, prop] of Object.entries(props)) if (key in value) assertOutput(prop, value[key], where + '.' + key)
+    return
+  }
+  if (schema.type === 'array') {
+    assert.ok(Array.isArray(value), where + ' 应为 array')
+    if (schema.items) value.forEach((item, index) => assertOutput(schema.items, item, where + '[' + index + ']'))
+    return
+  }
+  if (schema.type === 'string') return assert.equal(typeof value, 'string', where + ' 应为 string')
+  if (schema.type === 'number') return assert.equal(typeof value, 'number', where + ' 应为 number')
+  if (schema.type === 'boolean') return assert.equal(typeof value, 'boolean', where + ' 应为 boolean')
+}
+
 async function call(tools, name, args) {
   const tool = tools.get(name)
   assert.ok(tool, '工具未注册：' + name)
-  return tool.execute(args)
+  const value = await tool.execute(args)
+  assertOutput(tool.output && tool.output.schema, value, name)
+  return value
 }
 
 function readJson(file) {
@@ -116,7 +146,7 @@ test('plan → 重复执行 → collect 全链路（含 command 评分项）', a
 
   const compare = await call(tools, 'rsi-compare', { cwd, runId: 'it-run', a: 'base', b: 'cand', repeat: 1 })
   assert.equal(compare.summary.changed, 1)
-  assert.equal(compare.judge, null)
+  assert.equal('judge' in compare, false, '未给裁判结论时不应返回 judge 键（output.schema 声明为 object）')
   assert.ok(fs.existsSync(compare.comparePath))
   const judged = await call(tools, 'rsi-compare', {
     cwd, runId: 'it-run', a: 'base', b: 'cand', repeat: 1,

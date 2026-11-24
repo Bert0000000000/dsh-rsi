@@ -139,6 +139,7 @@ node --test "test/*.test.mjs"   # 28 项：schema/fsx/redact/regex-safe/rubric/c
 安装后 12 个 `rsi-*` 工具出现在模型工具集中（PTC 模式下以程序内 SDK 声明出现）；客户端面板「RSI 改进」在会话侧栏。
 ## 版本
 
+- 1.4.1：修复 `rsi-compare` 省略 `judge` 时返回 `judge:null` 违反自身 `output.schema`（运行时输出校验报 `value.judge must be an object`）；集成测试的 `call()` 现在按每个工具的 `output.schema` 校验返回值，防同类回归。
 - 1.4.0（B + C 批）：重复采样与统计判定（`repeats`/`minPassRate`/均值与标准差、缺跑记 0）；对比式探测 `rsi-compare`（目录 diff + judge）；组件级编辑合成（8 组件 `edits`）；`command` 评分项；预算校验与 `mode`（parallel/sequential）+ `meta` 复现元数据；`rsi-archive` 归档与 parent/children 血缘索引；采纳冒烟校验与自动回滚（C1）；写隔离审计 `rsi-audit`（C2）；证据脱敏（C3）；`stamp()` 毫秒（C4）；ReDoS 防护（C5）；`lib/` 拆分 + `node --test` 28 项单测（C6）。
 - 1.3.0（A 批修复）：采纳门禁（`rsi-adopt` 必须带 approved 提案、`applied` 只能来自 `approved`、失败回滚）；采纳白名单 fail-closed；证据修复（读宿主 `exec.arguments`、只采差评反馈、按会话落库）；评分表完整性（sha256 比对、删除 `rubric` 覆盖参数）；评分语义（空文件失败、manual 不进分母、任一失败即未通过）；状态隔离（按会话水位、已消化清单、坏状态转存、证据轮转、原子写 + `.bak`）。
 - 1.2.0：新增 `rsi-run`（实验状态机）、`rsi-lesson`（教训库）、turn/end 自动巡检摘要、`rsi-status` 增补 `digests`/`lessonEntries`/`lastDigestAt`。

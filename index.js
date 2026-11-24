@@ -1514,17 +1514,20 @@ function compareTool() {
           '4. 把该 JSON 作为 judge 参数再次调用 rsi-compare 回写结论。',
         ].join('\n')
       const diffText = `仅 A ${result.summary.onlyA}、仅 B ${result.summary.onlyB}、改动 ${result.summary.changed}、相同 ${result.summary.same}`
-      return {
+      // output.schema 里 judge 声明为 object：未提供裁判结论时必须省略该键，
+      // 直接返回 judge:null 会被运行时输出校验拒绝（value.judge must be an object）。
+      const output = {
         runId,
         a: labelA,
         b: labelB,
         repeat,
         summary: result.summary,
         comparePath: path.join(cwd, rel, 'compare.md'),
-        judge,
         instructions,
         note: '对比完成（' + diffText + '）' + (judge ? '；裁判结论：' + judge.winner + '（已回写）' : '；等待裁判子代理结论') + '\n报告：' + path.join(cwd, rel, 'compare.md'),
       }
+      if (judge) output.judge = judge
+      return output
     },
   }
 }
