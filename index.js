@@ -9,6 +9,8 @@ import { HARNESS_COMPONENTS, normalizeEdits, composeHarness } from './lib/compos
 import { compareDirs, renderCompareMarkdown } from './lib/compare.js'
 import { runRoot, listRuns, readRunIndex, writeRunIndex, upsertRun, runRecord, childrenOf, runMeta, archiveRun, restoreRun, readRunConfig, plannedRepeats, plannedMinPassRate } from './lib/runs.js'
 import { scanWrites } from './lib/audit.js'
+import { syncGlobalLedger } from './lib/overview.js'
+import { registerOverview } from './lib/overview-server.js'
 
 const name = 'rsi-toolkit'
 const inject = ['tools', 'sessions', 'workingDirectory']
@@ -1804,10 +1806,20 @@ export function apply(ctx) {
   register(auditTool)
 
   ctx.on('tools/result', (exec, result) => {
-    if (!result || result.isError !== true) return
+    if (!result) return
     // 宿主 exec 的参数字段是 arguments（不是 args），且 agent 才带 session id
     const sessionId = sessionIdOf(exec?.agent)
     if (!sessionId) return
+    if (result.isError !== true) {
+      // 教训或采纳成功后立刻汇总到全局账本，避免经验只留在单个工作区。
+      const toolName = String(exec?.name ?? '')
+      if (toolName === 'rsi-lesson' || toolName === 'rsi-adopt'
+        || toolName.endsWith('__rsi-lesson') || toolName.endsWith('__rsi-adopt')) {
+        const cwd = evidenceCwd(ctx, sessionId)
+        if (cwd) syncGlobalLedger([cwd]).catch(() => {})
+      }
+      return
+    }
     appendEvidence(ctx, sessionId, {
       ts: new Date().toISOString(),
       source: 'tool-error',
@@ -1855,6 +1867,9 @@ export function apply(ctx) {
     const sessionId = sessionIdOf(session)
     if (sessionId) maybeReflect(ctx, sessionId)
   })
+
+  // 全局总览 + 跨工作区经验账本的只读 HTTP 路由。
+  registerOverview(ctx)
 }
 
 export { name, inject }

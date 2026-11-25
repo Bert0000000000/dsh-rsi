@@ -1,6 +1,6 @@
 # dsh-rsi
 
-DeepSeek Harness 的 RSI（Recursive Self-Improvement）工具包：把 Harness² 的 Propose–Probe–Compose 循环固化为 12 个全局工具，并补齐「失败证据自动收集 → 反思任务卡 → 巡检摘要 → 提案审核 → 采纳（冒烟 + 回滚）→ 教训沉淀」闭环。所有写入都限制在工作区的 `.rsi` 目录（以及 adopt 允许的 harness 文件）内。
+DeepSeek Harness 的 RSI（Recursive Self-Improvement）工具包：把 Harness² 的 Propose–Probe–Compose 循环固化为 12 个全局工具，补齐「失败证据自动收集 → 反思任务卡 → 巡检摘要 → 提案审核 → 采纳（冒烟 + 回滚）→ 教训沉淀」闭环，并提供一个全局侧栏总览和跨工作区经验账本。工作区数据仍写在各工作区 `.rsi`；汇总账本写到 `~/.dsh/rsi`。
 
 ## 工具
 
@@ -59,7 +59,18 @@ feedback/committed   ┘        │
 - 水位与冷却记在 `.rsi/state/reflection.json`：反思按会话隔离，摘要用已消化清单（`digestConsumed[]`）判定未消化卡片。状态文件损坏会转存 `.corrupt-<stamp>.json` 并在 `rsi-status` 的 `stateError` 中告警。
 - 证据写入前经 `redactSecrets` 脱敏（OpenAI/AWS/GitHub/Slack 令牌、JWT、`Bearer` 头、`api_key|token|secret|password` 赋值），再按 500 字符截断；证据文件超 200 行或 200KB 时轮转 `.1.jsonl`。
 - 反思卡与巡检摘要只做提示与证据摘要，不自动改任何 harness 文件；采纳必须经过 `rsi-review approve` + `rsi-adopt`。
-- 本版未做：Host `HarnessEditor` service、插件页面板内的实时审核 UI（Electron 客户端无通用 host RPC 网关，面板为静态指引，数据以文件为准）。
+- 本版的面板是只读总览 + 账本，不含实时审核/采纳按钮；审核与采纳仍在对话里用 `rsi-review` / `rsi-adopt` 完成。
+
+## 全局总览与跨工作区经验账本
+
+安装后左侧栏出现「RSI 总览」：读取所有已注册工作区的 `.rsi`，合并实验、证据、教训与提案；可按工作区筛选，点开记录看详情。页面只读，不会修改 harness。
+
+- **手动同步**：账本页「同步账本」把所有工作区的教训/提案汇总到 `~/.dsh/rsi`（`ledger.json`、`lessons.md`）。
+- **自动同步**：`rsi-lesson` 或 `rsi-adopt` 成功后，Host 自动把当前工作区的经验并入账本；无需再点同步。
+- **跨工作区复用**：账本只提供证据索引，不会自动改任何文件；`rsi-adopt` 仍要求 approved 提案和冒烟检查。
+- **失败证据**：`tools/result` 失败、`agent/error`、差评反馈继续写入各工作区 `.rsi/evidence`；账本按 `sources` 记录来源工作区。
+
+> 账本是 profile 级（`~/.dsh/rsi`），不是某次会话的私有数据；所有工作区共享同一份经验索引。
 
 ## rubric 机器评分项
 
@@ -90,10 +101,11 @@ feedback/committed   ┘        │
 ## 单测
 
 ```bash
-node --test "test/*.test.mjs"   # 28 项：schema/fsx/redact/regex-safe/rubric/compose/compare + 集成
+node --test "test/*.test.mjs"   # 30 项：schema/fsx/redact/regex-safe/rubric/compose/compare/overview + 集成
 ```
 
 - `test/integration.test.mjs` 用 fake ctx 注册全部 12 工具，覆盖 plan→重复→collect、compare+judge、预算/非法 edits 拒绝、archive/restore、audit、adopt 冒烟回滚与门禁、证据脱敏。
+- `test/overview.test.mjs` 覆盖跨工作区聚合：合并 evidence/lessons、给条目打 workspace 标签、排除没有 `.rsi` 的候选。
 - 代码按职责拆在 `lib/`：`fsx`（文件与哈希、原子写）、`schema`（参数编译）、`text`、`redact`、`regex-safe`、`rubric`（评分与聚合）、`compose`（组件合成）、`compare`（目录 diff）、`runs`（run 目录与索引）、`audit`（写隔离扫描）。不引入任何 npm 依赖。
 
 ## 约束
@@ -131,14 +143,20 @@ node --test "test/*.test.mjs"   # 28 项：schema/fsx/redact/regex-safe/rubric/c
 
 ## 安装
 
-两种方式任选：
+三种方式任选：
 
 1. **profile link（本地开发）**：把本仓库路径加进 `~/.dsh/profiles/<name>/package.json` 的 `dependencies`（`"dsh-rsi": "link:D:/path/to/DSH-RSI"`），并在 `dsh.profile.bundles` 末尾追加 `"dsh-rsi"`，然后重启 DSH。
 2. **插件管理器**：DSH 侧边栏「插件」→ 右上「+ 添加插件」→ 输入本仓库路径或 npm 包名安装，然后在「已安装插件」里确认 `dsh-rsi` 为「运行中」。
 
-安装后 12 个 `rsi-*` 工具出现在模型工具集中（PTC 模式下以程序内 SDK 声明出现）；客户端面板「RSI 改进」在会话侧栏。
+3. **市场 tarball（v1.5.0 起）**：
+   ```bash
+   dsh plugin --profile web add -w "https://github.com/Bert0000000000/dsh-rsi/releases/download/v1.5.0/dsh-rsi-1.5.0.tgz"
+   ```
+
+安装后 12 个 `rsi-*` 工具出现在模型工具集中（PTC 模式下以程序内 SDK 声明出现）；客户端全局侧栏面板「RSI 总览」显示所有工作区的实验、证据、教训和提案，账本页可手动/自动同步。
 ## 版本
 
+- 1.5.0：合并全局总览/账本页面；新增 `~/.dsh/rsi` 跨工作区账本、手动同步，以及 `rsi-lesson` / `rsi-adopt` 成功后的自动同步；`dsh.client` 改为 slots 全局面板，不再依赖会话 inject。
 - 1.4.1：修复 `rsi-compare` 省略 `judge` 时返回 `judge:null` 违反自身 `output.schema`（运行时输出校验报 `value.judge must be an object`）；集成测试的 `call()` 现在按每个工具的 `output.schema` 校验返回值，防同类回归。
 - 1.4.0（B + C 批）：重复采样与统计判定（`repeats`/`minPassRate`/均值与标准差、缺跑记 0）；对比式探测 `rsi-compare`（目录 diff + judge）；组件级编辑合成（8 组件 `edits`）；`command` 评分项；预算校验与 `mode`（parallel/sequential）+ `meta` 复现元数据；`rsi-archive` 归档与 parent/children 血缘索引；采纳冒烟校验与自动回滚（C1）；写隔离审计 `rsi-audit`（C2）；证据脱敏（C3）；`stamp()` 毫秒（C4）；ReDoS 防护（C5）；`lib/` 拆分 + `node --test` 28 项单测（C6）。
 - 1.3.0（A 批修复）：采纳门禁（`rsi-adopt` 必须带 approved 提案、`applied` 只能来自 `approved`、失败回滚）；采纳白名单 fail-closed；证据修复（读宿主 `exec.arguments`、只采差评反馈、按会话落库）；评分表完整性（sha256 比对、删除 `rubric` 覆盖参数）；评分语义（空文件失败、manual 不进分母、任一失败即未通过）；状态隔离（按会话水位、已消化清单、坏状态转存、证据轮转、原子写 + `.bak`）。
