@@ -101,11 +101,12 @@ feedback/committed   ┘        │
 ## 单测
 
 ```bash
-node --test "test/*.test.mjs"   # 30 项：schema/fsx/redact/regex-safe/rubric/compose/compare/overview + 集成
+node --test "test/*.test.mjs"   # 32 项：schema/fsx/redact/regex-safe/rubric/compose/compare/overview + 集成
 ```
 
 - `test/integration.test.mjs` 用 fake ctx 注册全部 12 工具，覆盖 plan→重复→collect、compare+judge、预算/非法 edits 拒绝、archive/restore、audit、adopt 冒烟回滚与门禁、证据脱敏。
 - `test/overview.test.mjs` 覆盖跨工作区聚合：合并 evidence/lessons、给条目打 workspace 标签、排除没有 `.rsi` 的候选。
+- `test/overview-server.test.mjs` 覆盖 Host 路由注册：prefix/path/auth，以及空 ctx 的安全跳过。
 - 代码按职责拆在 `lib/`：`fsx`（文件与哈希、原子写）、`schema`（参数编译）、`text`、`redact`、`regex-safe`、`rubric`（评分与聚合）、`compose`（组件合成）、`compare`（目录 diff）、`runs`（run 目录与索引）、`audit`（写隔离扫描）。不引入任何 npm 依赖。
 
 ## 约束
