@@ -154,6 +154,10 @@ node --test "test/*.test.mjs"   # 30 项：schema/fsx/redact/regex-safe/rubric/c
    ```
 
 安装后 12 个 `rsi-*` 工具出现在模型工具集中（PTC 模式下以程序内 SDK 声明出现）；客户端全局侧栏面板「RSI 总览」显示所有工作区的实验、证据、教训和提案，账本页可手动/自动同步。
+## 调研
+
+Harness² 的方法、社区 `dsh-harness2` 在 DSH 里的调用链、成本与可借鉴点，见 [docs/harness2.md](docs/harness2.md)。
+
 ## 版本
 
 - 1.5.0：合并全局总览/账本页面；新增 `~/.dsh/rsi` 跨工作区账本、手动同步，以及 `rsi-lesson` / `rsi-adopt` 成功后的自动同步；`dsh.client` 改为 slots 全局面板，不再依赖会话 inject。
